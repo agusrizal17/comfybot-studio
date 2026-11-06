@@ -101,15 +101,17 @@ DEFAULT_MOTION = (
 )
 
 # --- HunyuanVideo 1.5 GGUF (video kedua; terpasang via install-hunyuan15.sh) ---
-# Resep DITURUNKAN dari template resmi (720p/121 frame) ke ±480p/81 frame:
-# di V100 ini GPU berbagi dengan miner host + VRAM sesak, 720p jalan
-# ±490 detik/step (62 menit/8 step) — tidak viable. Distilled I2V: 8 step
-# CFG 1; T2V reguler: 16 step CFG 6. Deadline job Hunyuan 45 menit.
-HY_T2V_FILE = "hunyuanvideo1.5_720p_t2v-Q8_0.gguf"
-HY_I2V_FILE = "hunyuanvideo1.5_720p_i2v_cfg_distilled-Q8_0.gguf"
+# PENTING: checkpoint 720p dan 480p itu fine-tune TERPISAH — model 720p yang
+# dipaksa jalan di latent 480p hasilnya rusak. Bot memakai varian 480p
+# CFG-distilled (8 step CFG 1) untuk T2V maupun I2V. I2V WAJIB pakai
+# CLIP Vision (sigclip) sebagai input HunyuanVideo15ImageToVideo — tanpa
+# itu model kehilangan sinyal identitas dari foto sumber.
+HY_T2V_FILE = "hunyuanvideo1.5_480p_t2v_cfg_distilled-Q8_0.gguf"
+HY_I2V_FILE = "hunyuanvideo1.5_480p_i2v_cfg_distilled-Q8_0.gguf"
 HY_VAE = "hunyuanvideo15_vae_fp16.safetensors"
 HY_CLIP1 = "qwen_2.5_vl_7b.safetensors"
 HY_CLIP2 = "byt5_small_glyphxl_fp16.safetensors"
+HY_CLIP_VISION = "sigclip_vision_patch14_384.safetensors"
 HY_FPS = 24
 
 STATE_TTL = 600  # detik, state/foto yang menunggu input berikutnya
@@ -319,16 +321,16 @@ def _hy_nodes(unet_file, prompt):
 
 
 def hy_t2v_graph(prompt: str, seed: int):
-    """Teks -> video Hunyuan 1.5 832x480, 81 frame @24fps (±3,4 detik)."""
+    """Teks -> video Hunyuan 1.5 (480p distilled) 832x480, 121 frame @24fps."""
     g = _hy_nodes(HY_T2V_FILE, prompt)
     g.update({
         "6": {"class_type": "EmptyHunyuanVideo15Latent",
-              "inputs": {"width": 832, "height": 480, "length": 81,
+              "inputs": {"width": 832, "height": 480, "length": 121,
                          "batch_size": 1}},
         "8": {"class_type": "KSampler",
               "inputs": {"model": ["5", 0], "positive": ["3", 0],
                          "negative": ["4", 0], "latent_image": ["6", 0],
-                         "seed": seed, "steps": 16, "cfg": 6.0,
+                         "seed": seed, "steps": 8, "cfg": 1.0,
                          "sampler_name": "euler", "scheduler": "simple",
                          "denoise": 1.0}},
         "9": {"class_type": "VAEDecode",
@@ -348,11 +350,17 @@ def hy_i2v_graph(image_name: str, prompt: str, seed: int):
                "inputs": {"image": ["11", 0], "upscale_method": "lanczos",
                           "megapixels": 0.4, "resolution_steps": 16}},
         "13": {"class_type": "GetImageSize", "inputs": {"image": ["12", 0]}},
+        "15": {"class_type": "CLIPVisionLoader",
+               "inputs": {"clip_name": HY_CLIP_VISION}},
+        "16": {"class_type": "CLIPVisionEncode",
+               "inputs": {"clip_vision": ["15", 0], "image": ["12", 0],
+                          "crop": "center"}},
         "14": {"class_type": "HunyuanVideo15ImageToVideo",
                "inputs": {"positive": ["3", 0], "negative": ["4", 0],
                           "vae": ["7", 0], "width": ["13", 0],
-                          "height": ["13", 1], "length": 81,
-                          "batch_size": 1, "start_image": ["12", 0]}},
+                          "height": ["13", 1], "length": 121,
+                          "batch_size": 1, "start_image": ["12", 0],
+                          "clip_vision_output": ["16", 0]}},
         "8": {"class_type": "KSampler",
               "inputs": {"model": ["5", 0], "positive": ["14", 0],
                          "negative": ["14", 1], "latent_image": ["14", 2],
