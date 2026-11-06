@@ -622,9 +622,7 @@ HELP_SUFFIX_ADMIN = (
 )
 
 HELP_SUFFIX_USER = (
-    "\n\n🎬 Fitur video saat ini khusus admin.\n"
-    "🔎 Demi keamanan bersama, hasil generate kamu diteruskan ke admin "
-    "untuk pemantauan penyalahgunaan."
+    "\n\n🎬 Fitur video saat ini khusus admin."
 )
 
 
