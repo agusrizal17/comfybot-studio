@@ -537,11 +537,16 @@ def comfy_upload(image_bytes: bytes, name: str) -> str:
 def bar_text(state: dict, label: str, emoji: str = "🎨") -> str:
     stage = state.get("stage") or "Siapkan"
     pct = state.get("pct")
+    t0 = state.get("t0")
+    elapsed = ""
+    if t0:
+        s = int(time.time() - t0)
+        elapsed = f" ⏱ {s // 60}:{s % 60:02d}"
     if pct is None:
-        return f"{emoji} {label} — {stage}…"
+        return f"{emoji} {label} — {stage}…{elapsed}"
     filled = max(0, min(10, round(pct / 10)))
     bar = "█" * filled + "░" * (10 - filled)
-    return f"{emoji} {label} — {stage}…\n[{bar}] {pct}%"
+    return f"{emoji} {label} — {stage}…{elapsed}\n[{bar}] {pct}%"
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +773,7 @@ async def job_worker():
             await msg.chat.send_action(
                 ChatAction.UPLOAD_VIDEO if kind == "video" else ChatAction.UPLOAD_PHOTO
             )
-            state: dict = {"stage": "Antri", "pct": None}
+            state: dict = {"stage": "Antri", "pct": None, "t0": time.time()}
 
             async def editor():
                 last = ""
