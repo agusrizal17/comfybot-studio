@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Bot Telegram untuk ComfyUI lokal (Qwen-Image 2.1 Turbo GGUF).
-- Kirim teks / perintah /gambar <prompt>  -> text-to-image
-- Kirim foto + caption perintah          -> edit foto itu
-- Kirim 2 foto (album) + caption          -> gabung dua foto jadi satu gambar edit
-  (foto tanpa caption juga bisa: foto disimpan dulu, perintah editnya
-   tinggal dikirim sebagai pesan teks berikutnya)
-Ada progress bar live (websocket ComfyUI) yang di-edit ke pesan status.
-Hanya merespons ADMIN_ID. Jalan di VM yang sama dengan ComfyUI (API localhost:8188).
+Bot Telegram PUBLIK untuk ComfyUI lokal (ComfyBot Studio v2).
+
+Akses: semua user Telegram, WAJIB join channel dulu (gate getChatMember).
+Navigasi full tombol (inline keyboard) — perintah teks tetap jalan:
+- /start atau /menu            -> menu utama (tombol)
+- Teks biasa / /gambar <prompt>-> text-to-image
+- Foto + caption perintah      -> edit foto (album 2 foto = gabung)
+- /video <prompt>              -> text-to-video; foto + caption /video = I2V
+
+Fitur publik: antrian global 1 GPU (satu job jalan dalam satu waktu),
+kuota harian per user (gambar/video, bisa diatur via .env), progress bar
+live via websocket ComfyUI. ADMIN_ID bebas kuota & bebas gate.
+
+Jalan di VM yang sama dengan ComfyUI (API localhost:8188).
+Konfigurasi via .env: BOT_TOKEN, ADMIN_ID, CHANNEL_USERNAME (@channel),
+IMG_QUOTA (default 10), VID_QUOTA (default 3).
 """
 import asyncio
 import io
@@ -20,10 +28,11 @@ import uuid
 
 import requests
 import websocket
-from telegram import Update
-from telegram.constants import ChatAction
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction, ChatMemberStatus
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -35,6 +44,10 @@ COMFY = "http://127.0.0.1:8188"
 COMFY_WS = "ws://127.0.0.1:8188/ws"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHANNEL = os.environ.get("CHANNEL_USERNAME", "").strip()  # contoh: @namachannel
+IMG_QUOTA = int(os.environ.get("IMG_QUOTA", "10"))
+VID_QUOTA = int(os.environ.get("VID_QUOTA", "3"))
+QUOTA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quota.json")
 
 # Aturan tetap untuk semua edit foto: dari foto referensi hanya wajah yang
 # diambil — ekspresi dan pakaian selalu dibuat baru mengikuti caption,
@@ -87,11 +100,15 @@ DEFAULT_MOTION = (
     "gentle slow camera movement, cinematic"
 )
 
-PENDING_TTL = 600  # detik, foto yang menunggu perintah edit
+STATE_TTL = 600  # detik, state/foto yang menunggu input berikutnya
 
-job_lock = asyncio.Lock()
 pending_photos: dict[int, dict] = {}   # user_id -> {"names": [...], "ts": float}
-album_buffers: dict[str, dict] = {}    # media_group_id -> {"items": [...], "caption": str, "gen": int}
+album_buffers: dict[str, dict] = {}    # media_group_id -> {...}
+user_state: dict[int, dict] = {}       # user_id -> {"mode": str, "names": [...], "ts": float}
+gate_cache: dict[int, tuple[float, bool]] = {}  # user_id -> (ts, joined)
+
+JOB_QUEUE: asyncio.Queue = asyncio.Queue()
+WORKER_BUSY = {"busy": False}
 
 STAGE_LABELS = {
     "UnetLoaderGGUF": "Muat model",
@@ -272,6 +289,10 @@ def wan_t2v_graph(prompt: str, seed: int):
     return g
 
 
+# ---------------------------------------------------------------------------
+# ComfyUI I/O
+# ---------------------------------------------------------------------------
+
 def _fetch_result(pid: str) -> bytes | None:
     """Ambil bytes gambar dari /history bila prompt sudah selesai."""
     h = requests.get(f"{COMFY}/history/{pid}", timeout=30)
@@ -436,10 +457,6 @@ def comfy_upload(image_bytes: bytes, name: str) -> str:
     return r.json()["name"]
 
 
-def is_admin(update: Update) -> bool:
-    return update.effective_user and update.effective_user.id == ADMIN_ID
-
-
 def bar_text(state: dict, label: str, emoji: str = "🎨") -> str:
     stage = state.get("stage") or "Siapkan"
     pct = state.get("pct")
@@ -450,82 +467,288 @@ def bar_text(state: dict, label: str, emoji: str = "🎨") -> str:
     return f"{emoji} {label} — {stage}…\n[{bar}] {pct}%"
 
 
-async def run_job(update: Update, graph, label: str, kind: str = "image"):
-    if job_lock.locked():
-        await update.message.reply_text("⏳ Masih ada proses yang jalan, tunggu selesai dulu ya.")
+# ---------------------------------------------------------------------------
+# User, gate channel, kuota
+# ---------------------------------------------------------------------------
+
+def is_admin_id(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _quota_load() -> dict:
+    try:
+        with open(QUOTA_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _quota_save(data: dict):
+    try:
+        with open(QUOTA_PATH, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def quota_left(user_id: int, kind: str) -> int:
+    limit = IMG_QUOTA if kind == "image" else VID_QUOTA
+    if is_admin_id(user_id):
+        return limit
+    used = _quota_load().get(_today(), {}).get(str(user_id), {})
+    return max(0, limit - int(used.get(kind, 0)))
+
+
+def quota_charge(user_id: int, kind: str) -> bool:
+    """Kurangi kuota 1. True bila berhasil (atau admin)."""
+    if is_admin_id(user_id):
+        return True
+    data = _quota_load()
+    today = _today()
+    day = {today: data.get(today, {})}  # buang hari lama sekalian
+    rec = day[today].setdefault(str(user_id), {"image": 0, "video": 0})
+    limit = IMG_QUOTA if kind == "image" else VID_QUOTA
+    if int(rec.get(kind, 0)) >= limit:
+        _quota_save(day)
+        return False
+    rec[kind] = int(rec.get(kind, 0)) + 1
+    _quota_save(day)
+    return True
+
+
+def quota_refund(user_id: int, kind: str):
+    if is_admin_id(user_id):
         return
-    emoji = "🎬" if kind == "video" else "🎨"
-    async with job_lock:
-        note = await update.message.reply_text(f"{emoji} {label} — mulai…")
-        await update.message.chat.send_action(
-            ChatAction.UPLOAD_VIDEO if kind == "video" else ChatAction.UPLOAD_PHOTO
+    data = _quota_load()
+    rec = data.get(_today(), {}).get(str(user_id))
+    if rec and int(rec.get(kind, 0)) > 0:
+        rec[kind] = int(rec[kind]) - 1
+        _quota_save(data)
+
+
+async def check_joined(bot, user_id: int, force: bool = False) -> bool:
+    """True bila user sudah join channel (atau gate nonaktif / admin)."""
+    if is_admin_id(user_id) or not CHANNEL:
+        return True
+    now = time.time()
+    cached = gate_cache.get(user_id)
+    if cached and not force and now - cached[0] < 300:
+        return cached[1]
+    joined = False
+    try:
+        member = await bot.get_chat_member(CHANNEL, user_id)
+        status = member.status
+        if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                      ChatMemberStatus.OWNER):
+            joined = True
+        elif status == ChatMemberStatus.RESTRICTED:
+            joined = bool(getattr(member, "is_member", False))
+    except Exception as e:  # noqa: BLE001
+        logging.warning("get_chat_member gagal untuk %s: %s", user_id, e)
+        joined = False
+    gate_cache[user_id] = (now, joined)
+    return joined
+
+
+# ---------------------------------------------------------------------------
+# UI: keyboard & teks
+# ---------------------------------------------------------------------------
+
+def gate_kb() -> InlineKeyboardMarkup:
+    url = "https://t.me/" + CHANNEL.lstrip("@")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Channel Dulu", url=url)],
+        [InlineKeyboardButton("✅ Sudah Join", callback_data="gate_check")],
+    ])
+
+
+def menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖼 Buat Gambar", callback_data="act_img"),
+         InlineKeyboardButton("✏️ Edit Foto", callback_data="act_edit")],
+        [InlineKeyboardButton("🎬 Buat Video", callback_data="act_vid"),
+         InlineKeyboardButton("📹 Gerakkan Foto", callback_data="act_i2v")],
+        [InlineKeyboardButton("ℹ️ Bantuan", callback_data="help")],
+    ])
+
+
+def cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Batal", callback_data="cancel_state")],
+    ])
+
+
+def motion_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Pakai Gerakan Bawaan", callback_data="default_motion")],
+        [InlineKeyboardButton("❌ Batal", callback_data="cancel_state")],
+    ])
+
+
+def back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("« Menu Utama", callback_data="menu")],
+    ])
+
+
+GATE_TEXT = (
+    "🔒 Bot ini khusus member channel.\n\n"
+    "Join dulu channel kami, habis itu pencet tombol ✅ Sudah Join ya."
+)
+
+HELP_TEXT = (
+    "ℹ️ *Cara pakai*\n\n"
+    "🖼 *Buat Gambar* — tulis prompt, gambar dibuat dari teks (±1 menit).\n"
+    "✏️ *Edit Foto* — kirim foto lalu tulis perintah editnya. Kirim 2 foto "
+    "sekaligus (album) buat menggabungkan dua orang jadi satu foto. Dari foto "
+    "referensi hanya wajah yang dipakai — ekspresi & pakaian selalu dibuat "
+    "baru mengikuti perintahmu.\n"
+    "🎬 *Buat Video* — tulis adegannya, jadi video ±5 detik (render beberapa "
+    "menit, sabar ya).\n"
+    "📹 *Gerakkan Foto* — kirim foto + tulis gerakannya, foto itu jadi video.\n\n"
+    "Semua request masuk ANTRIAN (GPU cuma bisa 1 job dalam satu waktu). "
+    "Ada kuota harian per user yang reset tiap hari.\n\n"
+    "Perintah teks juga bisa: /gambar <prompt>, /video <prompt>, atau kirim "
+    "foto + caption perintah langsung."
+)
+
+
+def menu_text(user_id: int, first_name: str = "") -> str:
+    if is_admin_id(user_id):
+        quota = "Kuota: ∞ (admin)"
+    else:
+        quota = (f"Sisa kuota hari ini: 🖼 {quota_left(user_id, 'image')}/{IMG_QUOTA}"
+                 f" • 🎬 {quota_left(user_id, 'video')}/{VID_QUOTA}")
+    hello = f"Halo {first_name} 👋" if first_name else "Halo 👋"
+    return (
+        f"{hello}\n\n"
+        "Selamat datang di *ComfyBot Studio* — studio gambar & video AI gratis.\n"
+        f"{quota}\n\n"
+        "Mau bikin apa? Pencet tombolnya aja 👇"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Antrian & worker
+# ---------------------------------------------------------------------------
+
+async def submit_job(msg, user_id: int, kind: str, graph, label: str):
+    """Masukkan job ke antrian global. kind: 'image' | 'video' (buat kuota)."""
+    if not quota_charge(user_id, kind):
+        await msg.reply_text(
+            "⚠️ Kuota harianmu habis buat hari ini. Coba lagi besok ya 🙏"
         )
-        state: dict = {"stage": "Antri", "pct": None}
+        return
+    await JOB_QUEUE.put({
+        "msg": msg, "user_id": user_id, "kind": kind,
+        "graph": graph, "label": label,
+    })
+    pos = JOB_QUEUE.qsize() + (1 if WORKER_BUSY["busy"] else 0)
+    if pos <= 1:
+        await msg.reply_text(f"📥 {label} — masuk antrian, langsung diproses…")
+    else:
+        await msg.reply_text(
+            f"📥 {label} — masuk antrian posisi ke-{pos}. "
+            "Ditunggu aja, hasilnya dikirim ke sini."
+        )
 
-        async def editor():
-            last = ""
-            while True:
-                await asyncio.sleep(3)
-                text = bar_text(state, label, emoji)
-                if text != last:
-                    last = text
-                    try:
-                        await note.edit_text(text)
-                    except Exception:  # noqa: BLE001
-                        pass
 
-        edit_task = asyncio.create_task(editor())
+async def job_worker():
+    """Satu-satunya yang menjalankan ComfyUI — job diproses satu per satu."""
+    while True:
+        job = await JOB_QUEUE.get()
+        WORKER_BUSY["busy"] = True
+        msg = job["msg"]
+        kind = job["kind"]
+        label = job["label"]
+        emoji = "🎬" if kind == "video" else "🎨"
+        note = None
+        edit_task = None
         try:
+            note = await msg.reply_text(f"{emoji} {label} — mulai…")
+            await msg.chat.send_action(
+                ChatAction.UPLOAD_VIDEO if kind == "video" else ChatAction.UPLOAD_PHOTO
+            )
+            state: dict = {"stage": "Antri", "pct": None}
+
+            async def editor():
+                last = ""
+                while True:
+                    await asyncio.sleep(3)
+                    text = bar_text(state, label, emoji)
+                    if text != last:
+                        last = text
+                        try:
+                            await note.edit_text(text)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+            edit_task = asyncio.create_task(editor())
             data = await asyncio.to_thread(
-                comfy_run, graph, state, kind,
+                comfy_run, job["graph"], state, kind,
                 1800 if kind == "video" else 900,
             )
             edit_task.cancel()
             if kind == "video":
-                await update.message.reply_video(
-                    video=io.BytesIO(data), supports_streaming=True
-                )
+                await msg.reply_video(video=io.BytesIO(data), supports_streaming=True)
             else:
-                await update.message.reply_photo(photo=io.BytesIO(data))
-            await note.delete()
-        except Exception as e:  # noqa: BLE001
-            edit_task.cancel()
+                await msg.reply_photo(photo=io.BytesIO(data))
             try:
-                await note.edit_text(f"❌ Gagal: {e}")
+                await note.delete()
             except Exception:  # noqa: BLE001
                 pass
+        except Exception as e:  # noqa: BLE001
+            quota_refund(job["user_id"], kind)
+            if edit_task:
+                edit_task.cancel()
+            if note is not None:
+                try:
+                    await note.edit_text(f"❌ Gagal: {e}")
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    await msg.reply_text(f"❌ Gagal: {e}")
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            WORKER_BUSY["busy"] = False
+            JOB_QUEUE.task_done()
 
 
-async def start_edit(update: Update, names: list[str], instruction: str):
+def seed() -> int:
+    return random.randint(0, 2**31 - 1)
+
+
+async def submit_t2i(msg, user_id: int, prompt: str):
+    await submit_job(msg, user_id, "image", t2i_graph(prompt, seed()), "Bikin gambar")
+
+
+async def submit_edit(msg, user_id: int, names: list[str], instruction: str):
     label = "Edit foto" if len(names) == 1 else "Gabung foto"
-    await run_job(
-        update,
-        edit_graph(instruction, names, random.randint(0, 2**31 - 1)),
-        label,
-    )
+    await submit_job(msg, user_id, "image", edit_graph(instruction, names, seed()), label)
 
 
-async def start_video_t2v(update: Update, prompt: str):
-    await run_job(
-        update,
-        wan_t2v_graph(prompt, random.randint(0, 2**31 - 1)),
-        "Bikin video",
-        kind="video",
-    )
+async def submit_t2v(msg, user_id: int, prompt: str):
+    await submit_job(msg, user_id, "video", wan_t2v_graph(prompt, seed()), "Bikin video")
 
 
-async def start_video_i2v(update: Update, name: str, motion: str):
-    await run_job(
-        update,
-        wan_i2v_graph(name, motion, random.randint(0, 2**31 - 1)),
-        "Gerakin foto jadi video",
-        kind="video",
-    )
+async def submit_i2v(msg, user_id: int, name: str, motion: str):
+    await submit_job(msg, user_id, "video", wan_i2v_graph(name, motion, seed()),
+                     "Gerakin foto jadi video")
 
 
-async def accept_photos(update: Update, raw_list: list[bytes], caption: str):
-    """Upload foto ke ComfyUI, lalu edit langsung (ada caption) atau simpan dulu."""
-    user_id = update.effective_user.id
+# ---------------------------------------------------------------------------
+# Alur foto
+# ---------------------------------------------------------------------------
+
+async def accept_photos(msg, user_id: int, raw_list: list[bytes],
+                        caption: str, mode_hint: str | None):
+    """Upload foto ke ComfyUI lalu rutekan sesuai mode/caption."""
     names = []
     try:
         for i, raw in enumerate(raw_list):
@@ -534,111 +757,278 @@ async def accept_photos(update: Update, raw_list: list[bytes], caption: str):
             )
             names.append(name)
     except Exception as e:  # noqa: BLE001
-        await update.message.reply_text(f"❌ Gagal upload foto ke ComfyUI: {e}")
+        await msg.reply_text(f"❌ Gagal upload foto ke ComfyUI: {e}")
         return
     cap = caption.strip()
+    if mode_hint == "i2v":
+        motion = cap[len("/video"):].strip() if cap.lower().startswith("/video") else cap
+        if motion:
+            await submit_i2v(msg, user_id, names[0], motion)
+        else:
+            user_state[user_id] = {"mode": "i2v_motion", "names": names, "ts": time.time()}
+            await msg.reply_text(
+                "📹 Foto diterima. Sekarang tulis gerakannya.\n"
+                "Contoh: tersenyum dan melambai ke kamera",
+                reply_markup=motion_kb(),
+            )
+        return
+    if mode_hint == "edit":
+        if cap:
+            await submit_edit(msg, user_id, names, cap)
+        else:
+            user_state[user_id] = {"mode": "edit_caption", "names": names, "ts": time.time()}
+            await msg.reply_text(
+                "✏️ Foto diterima. Sekarang kirim perintah edit-nya sebagai pesan teks.",
+                reply_markup=cancel_kb(),
+            )
+        return
+    # Tanpa mode tombol: perilaku klasik — caption /video = I2V, caption lain
+    # = edit, tanpa caption = simpan dulu & tunggu teks berikutnya.
     if cap.lower().startswith("/video"):
         motion = cap[len("/video"):].strip() or DEFAULT_MOTION
-        await start_video_i2v(update, names[0], motion)
+        await submit_i2v(msg, user_id, names[0], motion)
     elif cap:
-        await start_edit(update, names, cap)
+        await submit_edit(msg, user_id, names, cap)
     else:
         pending_photos[user_id] = {"names": names, "ts": time.time()}
-        await update.message.reply_text(
+        user_state[user_id] = {"mode": "edit_caption", "names": names, "ts": time.time()}
+        await msg.reply_text(
             f"📸 {len(names)} foto diterima. Sekarang kirim perintah edit-nya sebagai pesan teks.\n"
-            "Contoh: gabungkan kedua orang ini jadi foto pengantin adat Jawa serba putih"
+            "Contoh: gabungkan kedua orang ini jadi foto pengantin adat Jawa serba putih\n"
+            "Atau /video <gerakan> buat digerakin jadi video."
         )
 
 
-async def finalize_album(media_group_id: str, gen: int, first_update: Update):
+async def finalize_album(media_group_id: str, gen: int):
     await asyncio.sleep(3)
     buf = album_buffers.get(media_group_id)
     if not buf or buf["gen"] != gen:
         return  # masih ada foto susulan; pemanggil terakhir yang mengeksekusi
     album_buffers.pop(media_group_id, None)
-    await accept_photos(first_update, buf["items"], buf["caption"])
+    await accept_photos(buf["msg"], buf["user_id"], buf["items"],
+                        buf["caption"], buf["mode"])
 
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    user = update.effective_user
+    if not user or not await check_joined(ctx.bot, user.id):
         return
-    photo = update.message.photo[-1]
+    msg = update.message
+    photo = msg.photo[-1]
     tg_file = await photo.get_file()
     raw = bytes(await tg_file.download_as_bytearray())
-    group_id = update.message.media_group_id
-    caption = (update.message.caption or "").strip()
+    caption = (msg.caption or "").strip()
+    st = user_state.get(user.id)
+    mode_hint = None
+    if st and time.time() - st["ts"] < STATE_TTL:
+        if st["mode"] == "photo_edit":
+            mode_hint = "edit"
+            user_state.pop(user.id, None)
+        elif st["mode"] == "photo_i2v":
+            mode_hint = "i2v"
+            user_state.pop(user.id, None)
+    group_id = msg.media_group_id
     if group_id:
-        buf = album_buffers.setdefault(
-            group_id, {"items": [], "caption": "", "gen": 0}
-        )
+        buf = album_buffers.setdefault(group_id, {
+            "items": [], "caption": "", "gen": 0,
+            "msg": msg, "user_id": user.id, "mode": mode_hint,
+        })
         buf["items"].append(raw)
         if caption:
             buf["caption"] = caption
         buf["gen"] += 1
-        asyncio.create_task(finalize_album(group_id, buf["gen"], update))
+        asyncio.create_task(finalize_album(group_id, buf["gen"]))
     else:
-        await accept_photos(update, [raw], caption)
+        await accept_photos(msg, user.id, [raw], caption, mode_hint)
 
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    await update.message.reply_text(
-        "Halo bro 👋\n\n"
-        "• Kirim teks biasa atau /gambar <prompt> → bikin gambar dari teks.\n"
-        "• Kirim foto + caption perintah → edit foto itu.\n"
-        "• Kirim 2 foto sekaligus (album) + caption → gabung dua foto jadi satu gambar.\n"
-        "• Foto tanpa caption juga bisa — perintah editnya kirim sebagai teks setelahnya.\n"
-        "• Aturan bawaan edit: dari foto cuma wajahnya yang dipakai — ekspresi & pakaian selalu dibikin baru ngikutin caption (kecuali lu tulis sebaliknya).\n"
-        "• /video <prompt> → bikin video dari teks (±5 detik, render makan menit).\n"
-        "• Kirim foto + caption diawali /video → foto itu digerakin jadi video. Contoh caption: /video tersenyum dan melambai ke kamera\n\n"
-        "Contoh: kirim foto kamu + foto pasangan sebagai album, caption-nya: "
-        "combine both people into a Javanese wedding portrait, white traditional attire"
-    )
-
-
-async def cmd_gambar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    prompt = " ".join(ctx.args).strip()
-    if not prompt:
-        await update.message.reply_text("Isi prompt-nya bro, contoh: /gambar a cat wearing sunglasses")
-        return
-    await run_job(update, t2i_graph(prompt, random.randint(0, 2**31 - 1)), "Bikin gambar")
-
-
-async def cmd_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    prompt = " ".join(ctx.args).strip()
-    user_id = update.effective_user.id
-    pend = pending_photos.get(user_id)
-    if pend and time.time() - pend["ts"] < PENDING_TTL:
-        pending_photos.pop(user_id, None)
-        await start_video_i2v(update, pend["names"][0], prompt or DEFAULT_MOTION)
-        return
-    if not prompt:
-        await update.message.reply_text(
-            "Isi prompt-nya bro, contoh: /video a cat walking on the beach at sunset\n"
-            "Atau kirim foto dulu, terus /video <gerakan> buat gerakin foto itu."
-        )
-        return
-    await start_video_t2v(update, prompt)
-
+# ---------------------------------------------------------------------------
+# Handler teks, perintah, tombol
+# ---------------------------------------------------------------------------
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    user = update.effective_user
+    if not user or not await check_joined(ctx.bot, user.id):
         return
     text = (update.message.text or "").strip()
     if not text:
         return
-    user_id = update.effective_user.id
-    pend = pending_photos.get(user_id)
-    if pend and time.time() - pend["ts"] < PENDING_TTL:
-        pending_photos.pop(user_id, None)
-        await start_edit(update, pend["names"], text)
+    msg = update.message
+    st = user_state.get(user.id)
+    if st and time.time() - st["ts"] < STATE_TTL:
+        mode = st["mode"]
+        user_state.pop(user.id, None)
+        if mode == "prompt_img":
+            await submit_t2i(msg, user.id, text)
+            return
+        if mode == "prompt_vid":
+            await submit_t2v(msg, user.id, text)
+            return
+        if mode == "edit_caption":
+            pending_photos.pop(user.id, None)
+            await submit_edit(msg, user.id, st["names"], text)
+            return
+        if mode == "i2v_motion":
+            await submit_i2v(msg, user.id, st["names"][0], text)
+            return
+    pend = pending_photos.get(user.id)
+    if pend and time.time() - pend["ts"] < STATE_TTL:
+        pending_photos.pop(user.id, None)
+        await submit_edit(msg, user.id, pend["names"], text)
         return
-    await run_job(update, t2i_graph(text, random.randint(0, 2**31 - 1)), "Bikin gambar")
+    await submit_t2i(msg, user.id, text)
+
+
+async def send_gate(update: Update):
+    await update.message.reply_text(GATE_TEXT, reply_markup=gate_kb())
+
+
+async def send_menu(update: Update):
+    user = update.effective_user
+    await update.message.reply_text(
+        menu_text(user.id, user.first_name or ""),
+        reply_markup=menu_kb(), parse_mode="Markdown",
+    )
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_joined(ctx.bot, update.effective_user.id):
+        await send_gate(update)
+        return
+    await send_menu(update)
+
+
+async def cmd_gambar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_joined(ctx.bot, update.effective_user.id):
+        await send_gate(update)
+        return
+    prompt = " ".join(ctx.args).strip()
+    if not prompt:
+        await update.message.reply_text(
+            "Isi prompt-nya, contoh: /gambar a cat wearing sunglasses"
+        )
+        return
+    await submit_t2i(update.message, update.effective_user.id, prompt)
+
+
+async def cmd_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await check_joined(ctx.bot, user_id):
+        await send_gate(update)
+        return
+    prompt = " ".join(ctx.args).strip()
+    pend = pending_photos.get(user_id)
+    if pend and time.time() - pend["ts"] < STATE_TTL:
+        pending_photos.pop(user_id, None)
+        user_state.pop(user_id, None)
+        await submit_i2v(update.message, user_id, pend["names"][0],
+                         prompt or DEFAULT_MOTION)
+        return
+    if not prompt:
+        await update.message.reply_text(
+            "Isi prompt-nya, contoh: /video a cat walking on the beach at sunset\n"
+            "Atau kirim foto dulu, terus /video <gerakan> buat gerakin foto itu."
+        )
+        return
+    await submit_t2v(update.message, user_id, prompt)
+
+
+ASK_TEXTS = {
+    "act_img": ("prompt_img",
+                "🖼 Kirim prompt gambarnya sekarang.\n"
+                "Contoh: a majestic waterfall in a lush jungle, golden hour"),
+    "act_edit": ("photo_edit",
+                 "✏️ Kirim foto yang mau diedit (boleh 1 foto, atau album 2 foto "
+                 "buat gabung dua orang). Habis itu tulis perintah edit-nya — "
+                 "atau langsung tulis perintahnya sebagai caption foto."),
+    "act_vid": ("prompt_vid",
+                "🎬 Tulis adegan videonya sekarang.\n"
+                "Contoh: a cat walking on the beach at sunset"),
+    "act_i2v": ("photo_i2v",
+                "📹 Kirim fotonya sekarang. Habis itu tulis gerakannya — "
+                "atau tulis gerakannya langsung sebagai caption foto."),
+}
+
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    data = query.data or ""
+    if data == "gate_check":
+        if await check_joined(ctx.bot, user.id, force=True):
+            await query.answer("Mantap, keanggotaan terverifikasi ✅")
+            try:
+                await query.edit_message_text(
+                    menu_text(user.id, user.first_name or ""),
+                    reply_markup=menu_kb(), parse_mode="Markdown",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            await query.answer(
+                "Kamu belum tercatat join channel. Join dulu ya, baru pencet lagi.",
+                show_alert=True,
+            )
+        return
+    if not await check_joined(ctx.bot, user.id):
+        await query.answer("Join channel dulu ya 🙏", show_alert=True)
+        return
+    if data == "menu":
+        user_state.pop(user.id, None)
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                menu_text(user.id, user.first_name or ""),
+                reply_markup=menu_kb(), parse_mode="Markdown",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if data == "help":
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                HELP_TEXT, reply_markup=back_kb(), parse_mode="Markdown",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if data in ASK_TEXTS:
+        mode, text = ASK_TEXTS[data]
+        user_state[user.id] = {"mode": mode, "names": [], "ts": time.time()}
+        await query.answer()
+        try:
+            await query.edit_message_text(text, reply_markup=cancel_kb())
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if data == "cancel_state":
+        user_state.pop(user.id, None)
+        await query.answer("Dibatalkan.")
+        try:
+            await query.edit_message_text(
+                menu_text(user.id, user.first_name or ""),
+                reply_markup=menu_kb(), parse_mode="Markdown",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if data == "default_motion":
+        st = user_state.get(user.id)
+        await query.answer()
+        if st and st["mode"] == "i2v_motion":
+            user_state.pop(user.id, None)
+            await submit_i2v(query.message, user.id, st["names"][0], DEFAULT_MOTION)
+        return
+    await query.answer()
+
+
+async def _post_init(app: Application):
+    asyncio.create_task(job_worker())
+    if CHANNEL:
+        logging.info("Gate channel aktif: %s", CHANNEL)
+    else:
+        logging.warning("CHANNEL_USERNAME kosong — gate join channel NONAKTIF.")
 
 
 def main():
@@ -656,11 +1046,14 @@ def main():
         .token(BOT_TOKEN)
         .request(req)
         .get_updates_request(req)
+        .post_init(_post_init)
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_start))
     app.add_handler(CommandHandler("gambar", cmd_gambar))
     app.add_handler(CommandHandler("video", cmd_video))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     print("Bot jalan. Ctrl+C untuk berhenti.")

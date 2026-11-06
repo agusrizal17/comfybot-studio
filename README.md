@@ -17,6 +17,15 @@ The whole stack is self-hosted on a single rented GPU instance and built from op
 - **Single-operator lock** — the bot only responds to one configured Telegram user ID
 - **Runs unattended** — ComfyUI and the bot are systemd services with auto-restart
 
+### Public mode (v2)
+
+The bot now ships in a public configuration built for sharing with a community:
+
+- **Open to all Telegram users**, gated by **mandatory channel membership** — users must join a configured Telegram channel first (checked live via `getChatMember`; the bot must be an admin in that channel)
+- **Button-first UI** — an inline-keyboard main menu (Make Image / Edit Photo / Make Video / Animate Photo / Help); no commands to memorize, text commands still work
+- **Global queue** — one GPU means one job at a time; everyone sees their queue position and a live progress bar
+- **Per-user daily quotas** for images and videos (configurable in `.env`, admin exempt, failed jobs refunded)
+
 ## Why GGUF, and why a V100?
 
 This project targets the hardware that is actually affordable for indie builders in Southeast Asia: previous-generation datacenter cards like the Tesla V100 (Volta, `sm_70`). Two hard constraints shaped the design:
@@ -39,6 +48,7 @@ Developed and running on a **Tesla V100 SXM3 32GB** instance from [CloudRift](ht
 ## Repository layout
 
 ```
+setup.sh     One-paste installer for a fresh VPS (everything below, unattended)
 install/     One-shot install scripts (Qwen-Image stack, Wan 2.2 stack)
 workflows/   ComfyUI API-format workflow JSON (GGUF image generate + edit)
 bot/         The Telegram bot (python-telegram-bot) + .env.example
@@ -47,7 +57,13 @@ systemd/     Service units for ComfyUI and the bot (edit user/paths first)
 
 ## Quick start
 
-Assumes a fresh Ubuntu 24.04 GPU instance with ComfyUI already cloned to `~/ComfyUI`.
+**One-paste install** on a fresh Ubuntu 24.04 GPU instance — installs ComfyUI, both model stacks (~79 GB), the bot and the systemd services, then asks for your bot token, admin ID and channel:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/agusrizal17/comfybot-studio/main/setup.sh | bash
+```
+
+Manual route, assuming ComfyUI is already cloned to `~/ComfyUI`:
 
 ```bash
 # 1. Image stack (Qwen-Image GGUF + pinned torch)
