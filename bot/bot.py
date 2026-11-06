@@ -100,11 +100,23 @@ DEFAULT_MOTION = (
     "gentle slow camera movement, cinematic"
 )
 
+# --- HunyuanVideo 1.5 GGUF (video kedua; terpasang via install-hunyuan15.sh) ---
+# Resep template resmi ComfyUI: 720p, 121 frame @24fps, euler, shift 7.
+# T2V pakai model reguler (20 step CFG 6); I2V pakai varian CFG-distilled
+# (8 step CFG 1) biar cepat, pola yang sama kayak Lightning di Wan.
+HY_T2V_FILE = "hunyuanvideo1.5_720p_t2v-Q8_0.gguf"
+HY_I2V_FILE = "hunyuanvideo1.5_720p_i2v_cfg_distilled-Q8_0.gguf"
+HY_VAE = "hunyuanvideo15_vae_fp16.safetensors"
+HY_CLIP1 = "qwen_2.5_vl_7b.safetensors"
+HY_CLIP2 = "byt5_small_glyphxl_fp16.safetensors"
+HY_FPS = 24
+
 STATE_TTL = 600  # detik, state/foto yang menunggu input berikutnya
 
 pending_photos: dict[int, dict] = {}   # user_id -> {"names": [...], "ts": float}
 album_buffers: dict[str, dict] = {}    # media_group_id -> {...}
 user_state: dict[int, dict] = {}       # user_id -> {"mode": str, "names": [...], "ts": float}
+i2v_engine: dict[int, str] = {}        # user_id -> "wan" | "hy" (dibawa dari tombol ke alur foto)
 gate_cache: dict[int, tuple[float, bool]] = {}  # user_id -> (ts, joined)
 
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
@@ -289,6 +301,71 @@ def wan_t2v_graph(prompt: str, seed: int):
     return g
 
 
+def _hy_nodes(unet_file, prompt):
+    return {
+        "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": unet_file}},
+        "2": {"class_type": "DualCLIPLoader",
+              "inputs": {"clip_name1": HY_CLIP1, "clip_name2": HY_CLIP2,
+                         "type": "hunyuan_video_15", "device": "default"}},
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"clip": ["2", 0], "text": prompt}},
+        "4": {"class_type": "CLIPTextEncode",
+              "inputs": {"clip": ["2", 0], "text": ""}},
+        "5": {"class_type": "ModelSamplingSD3",
+              "inputs": {"model": ["1", 0], "shift": 7.0}},
+        "7": {"class_type": "VAELoader", "inputs": {"vae_name": HY_VAE}},
+    }
+
+
+def hy_t2v_graph(prompt: str, seed: int):
+    """Teks -> video Hunyuan 1.5 1280x720, 121 frame @24fps (±5 detik)."""
+    g = _hy_nodes(HY_T2V_FILE, prompt)
+    g.update({
+        "6": {"class_type": "EmptyHunyuanVideo15Latent",
+              "inputs": {"width": 1280, "height": 720, "length": 121,
+                         "batch_size": 1}},
+        "8": {"class_type": "KSampler",
+              "inputs": {"model": ["5", 0], "positive": ["3", 0],
+                         "negative": ["4", 0], "latent_image": ["6", 0],
+                         "seed": seed, "steps": 20, "cfg": 6.0,
+                         "sampler_name": "euler", "scheduler": "simple",
+                         "denoise": 1.0}},
+        "9": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["8", 0], "vae": ["7", 0]}},
+        "10": {"class_type": "SaveImage",
+               "inputs": {"images": ["9", 0], "filename_prefix": "comfybot"}},
+    })
+    return g
+
+
+def hy_i2v_graph(image_name: str, prompt: str, seed: int):
+    """Foto -> video Hunyuan 1.5 (distilled): foto diskalakan ke ±720p."""
+    g = _hy_nodes(HY_I2V_FILE, prompt)
+    g.update({
+        "11": {"class_type": "LoadImage", "inputs": {"image": image_name}},
+        "12": {"class_type": "ImageScaleToTotalPixels",
+               "inputs": {"image": ["11", 0], "upscale_method": "lanczos",
+                          "megapixels": 0.92, "resolution_steps": 16}},
+        "13": {"class_type": "GetImageSize", "inputs": {"image": ["12", 0]}},
+        "14": {"class_type": "HunyuanVideo15ImageToVideo",
+               "inputs": {"positive": ["3", 0], "negative": ["4", 0],
+                          "vae": ["7", 0], "width": ["13", 0],
+                          "height": ["13", 1], "length": 121,
+                          "batch_size": 1, "start_image": ["12", 0]}},
+        "8": {"class_type": "KSampler",
+              "inputs": {"model": ["5", 0], "positive": ["14", 0],
+                         "negative": ["14", 1], "latent_image": ["14", 2],
+                         "seed": seed, "steps": 8, "cfg": 1.0,
+                         "sampler_name": "euler", "scheduler": "simple",
+                         "denoise": 1.0}},
+        "9": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["8", 0], "vae": ["7", 0]}},
+        "10": {"class_type": "SaveImage",
+               "inputs": {"images": ["9", 0], "filename_prefix": "comfybot"}},
+    })
+    return g
+
+
 # ---------------------------------------------------------------------------
 # ComfyUI I/O
 # ---------------------------------------------------------------------------
@@ -349,7 +426,7 @@ def _fetch_frames(pid: str) -> list[bytes] | None:
     return frames
 
 
-def _stitch_mp4(frames: list[bytes]) -> bytes:
+def _stitch_mp4(frames: list[bytes], fps: int = VIDEO_FPS) -> bytes:
     """Rakit frame PNG jadi mp4 (H.264) pakai ffmpeg di VM ini."""
     import subprocess
     import tempfile
@@ -360,7 +437,7 @@ def _stitch_mp4(frames: list[bytes]) -> bytes:
                 fh.write(fr)
         out = os.path.join(td, "out.mp4")
         subprocess.run(
-            ["ffmpeg", "-y", "-framerate", str(VIDEO_FPS),
+            ["ffmpeg", "-y", "-framerate", str(fps),
              "-i", os.path.join(td, "f%04d.png"),
              "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", out],
             check=True, capture_output=True, timeout=600,
@@ -369,17 +446,17 @@ def _stitch_mp4(frames: list[bytes]) -> bytes:
             return fh.read()
 
 
-def _result_for(pid: str, kind: str):
+def _result_for(pid: str, kind: str, fps: int = VIDEO_FPS):
     if kind == "video":
         frames = _fetch_frames(pid)
         if frames is None:
             return None
-        return _stitch_mp4(frames)
+        return _stitch_mp4(frames, fps)
     return _fetch_result(pid)
 
 
 def comfy_run(graph, state: dict, kind: str = "image",
-              deadline_s: int = 900) -> bytes:
+              deadline_s: int = 900, fps: int = VIDEO_FPS) -> bytes:
     """Antri workflow, pantau progress via websocket, kembalikan bytes hasil.
 
     state diisi dari thread ini: {"stage": str, "pct": int | None}
@@ -402,7 +479,7 @@ def comfy_run(graph, state: dict, kind: str = "image",
             try:
                 raw = ws.recv()
             except websocket.WebSocketTimeoutException:
-                img = _result_for(pid, kind)
+                img = _result_for(pid, kind, fps)
                 if img:
                     return img
                 continue
@@ -419,7 +496,7 @@ def comfy_run(graph, state: dict, kind: str = "image",
             if mtype == "executing":
                 node = data.get("node")
                 if node is None:
-                    img = _result_for(pid, kind)
+                    img = _result_for(pid, kind, fps)
                     if img:
                         return img
                 else:
@@ -618,7 +695,9 @@ HELP_TEXT = (
 )
 
 HELP_SUFFIX_ADMIN = (
-    "\n\n🎬 *Buat Video* & 📹 *Gerakkan Foto* — aktif buat kamu (admin)."
+    "\n\n🎬 *Buat Video* & 📹 *Gerakkan Foto* — aktif buat kamu (admin). "
+    "Pas bikin video kamu bisa milih mesin: Wan 2.2 (detail, lambat) atau "
+    "Hunyuan 1.5 (720p, lebih cepat)."
 )
 
 HELP_SUFFIX_USER = (
@@ -645,7 +724,7 @@ def menu_text(user_id: int, first_name: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 async def submit_job(msg, user_id: int, kind: str, graph, label: str,
-                     prompt_text: str = ""):
+                     prompt_text: str = "", fps: int = VIDEO_FPS):
     """Masukkan job ke antrian global. kind: 'image' | 'video' (buat kuota)."""
     if not quota_charge(user_id, kind):
         await msg.reply_text(
@@ -661,7 +740,7 @@ async def submit_job(msg, user_id: int, kind: str, graph, label: str,
     await JOB_QUEUE.put({
         "msg": msg, "user_id": user_id, "kind": kind,
         "graph": graph, "label": label, "prompt": prompt_text,
-        "user_label": user_label,
+        "user_label": user_label, "fps": fps,
     })
     pos = JOB_QUEUE.qsize() + (1 if WORKER_BUSY["busy"] else 0)
     if pos <= 1:
@@ -707,6 +786,7 @@ async def job_worker():
             data = await asyncio.to_thread(
                 comfy_run, job["graph"], state, kind,
                 1800 if kind == "video" else 900,
+                job.get("fps", VIDEO_FPS),
             )
             edit_task.cancel()
             if kind == "video":
@@ -768,14 +848,24 @@ async def submit_edit(msg, user_id: int, names: list[str], instruction: str):
                      label, instruction)
 
 
-async def submit_t2v(msg, user_id: int, prompt: str):
-    await submit_job(msg, user_id, "video", wan_t2v_graph(prompt, seed()),
-                     "Bikin video", prompt)
+async def submit_t2v(msg, user_id: int, prompt: str, engine: str = "wan"):
+    if engine == "hy":
+        await submit_job(msg, user_id, "video", hy_t2v_graph(prompt, seed()),
+                         "Bikin video (Hunyuan 1.5)", prompt, fps=HY_FPS)
+    else:
+        await submit_job(msg, user_id, "video", wan_t2v_graph(prompt, seed()),
+                         "Bikin video", prompt)
 
 
-async def submit_i2v(msg, user_id: int, name: str, motion: str):
-    await submit_job(msg, user_id, "video", wan_i2v_graph(name, motion, seed()),
-                     "Gerakin foto jadi video", motion)
+async def submit_i2v(msg, user_id: int, name: str, motion: str,
+                     engine: str = "wan"):
+    if engine == "hy":
+        await submit_job(msg, user_id, "video", hy_i2v_graph(name, motion, seed()),
+                         "Gerakin foto jadi video (Hunyuan 1.5)", motion,
+                         fps=HY_FPS)
+    else:
+        await submit_job(msg, user_id, "video", wan_i2v_graph(name, motion, seed()),
+                         "Gerakin foto jadi video", motion)
 
 
 # ---------------------------------------------------------------------------
@@ -800,11 +890,13 @@ async def accept_photos(msg, user_id: int, raw_list: list[bytes],
         if not is_admin_id(user_id):
             await msg.reply_text("🔒 Fitur video khusus admin.")
             return
+        engine = i2v_engine.pop(user_id, "wan")
         motion = cap[len("/video"):].strip() if cap.lower().startswith("/video") else cap
         if motion:
-            await submit_i2v(msg, user_id, names[0], motion)
+            await submit_i2v(msg, user_id, names[0], motion, engine)
         else:
-            user_state[user_id] = {"mode": "i2v_motion", "names": names, "ts": time.time()}
+            user_state[user_id] = {"mode": "i2v_motion", "names": names,
+                                   "engine": engine, "ts": time.time()}
             await msg.reply_text(
                 "📹 Foto diterima. Sekarang tulis gerakannya.\n"
                 "Contoh: tersenyum dan melambai ke kamera",
@@ -870,6 +962,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             user_state.pop(user.id, None)
         elif st["mode"] == "photo_i2v":
             mode_hint = "i2v"
+            i2v_engine[user.id] = st.get("engine", "wan")
             user_state.pop(user.id, None)
     group_id = msg.media_group_id
     if group_id:
@@ -906,14 +999,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await submit_t2i(msg, user.id, text)
             return
         if mode == "prompt_vid":
-            await submit_t2v(msg, user.id, text)
+            await submit_t2v(msg, user.id, text, st.get("engine", "wan"))
             return
         if mode == "edit_caption":
             pending_photos.pop(user.id, None)
             await submit_edit(msg, user.id, st["names"], text)
             return
         if mode == "i2v_motion":
-            await submit_i2v(msg, user.id, st["names"][0], text)
+            await submit_i2v(msg, user.id, st["names"][0], text,
+                             st.get("engine", "wan"))
             return
     pend = pending_photos.get(user.id)
     if pend and time.time() - pend["ts"] < STATE_TTL:
@@ -1041,10 +1135,39 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:  # noqa: BLE001
             pass
         return
-    if data in ASK_TEXTS:
-        if data in ("act_vid", "act_i2v") and not is_admin_id(user.id):
+    if data in ("act_vid", "act_i2v"):
+        if not is_admin_id(user.id):
             await query.answer("🔒 Fitur video khusus admin.", show_alert=True)
             return
+        kind = "vid" if data == "act_vid" else "i2v"
+        title = "🎬 Buat Video" if kind == "vid" else "📹 Gerakkan Foto"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Wan 2.2 — detail, lebih lambat",
+                                  callback_data=f"eng:wan:{kind}")],
+            [InlineKeyboardButton("Hunyuan 1.5 — 720p, lebih cepat",
+                                  callback_data=f"eng:hy:{kind}")],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
+        ])
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                f"{title}\nPilih mesin videonya:", reply_markup=kb,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if data.startswith("eng:"):
+        _, eng, ekind = data.split(":")
+        mode, text = ASK_TEXTS["act_vid" if ekind == "vid" else "act_i2v"]
+        user_state[user.id] = {"mode": mode, "names": [], "engine": eng,
+                               "ts": time.time()}
+        await query.answer()
+        try:
+            await query.edit_message_text(text, reply_markup=cancel_kb())
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if data in ASK_TEXTS:
         mode, text = ASK_TEXTS[data]
         user_state[user.id] = {"mode": mode, "names": [], "ts": time.time()}
         await query.answer()
@@ -1069,7 +1192,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         if st and st["mode"] == "i2v_motion":
             user_state.pop(user.id, None)
-            await submit_i2v(query.message, user.id, st["names"][0], DEFAULT_MOTION)
+            await submit_i2v(query.message, user.id, st["names"][0],
+                             DEFAULT_MOTION, st.get("engine", "wan"))
         return
     await query.answer()
 
