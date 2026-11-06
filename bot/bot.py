@@ -566,14 +566,18 @@ def gate_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton("🖼 Buat Gambar", callback_data="act_img"),
          InlineKeyboardButton("✏️ Edit Foto", callback_data="act_edit")],
-        [InlineKeyboardButton("🎬 Buat Video", callback_data="act_vid"),
-         InlineKeyboardButton("📹 Gerakkan Foto", callback_data="act_i2v")],
-        [InlineKeyboardButton("ℹ️ Bantuan", callback_data="help")],
-    ])
+    ]
+    if is_admin_id(user_id):
+        rows.append(
+            [InlineKeyboardButton("🎬 Buat Video", callback_data="act_vid"),
+             InlineKeyboardButton("📹 Gerakkan Foto", callback_data="act_i2v")]
+        )
+    rows.append([InlineKeyboardButton("ℹ️ Bantuan", callback_data="help")])
+    return InlineKeyboardMarkup(rows)
 
 
 def cancel_kb() -> InlineKeyboardMarkup:
@@ -606,14 +610,21 @@ HELP_TEXT = (
     "✏️ *Edit Foto* — kirim foto lalu tulis perintah editnya. Kirim 2 foto "
     "sekaligus (album) buat menggabungkan dua orang jadi satu foto. Dari foto "
     "referensi hanya wajah yang dipakai — ekspresi & pakaian selalu dibuat "
-    "baru mengikuti perintahmu.\n"
-    "🎬 *Buat Video* — tulis adegannya, jadi video ±5 detik (render beberapa "
-    "menit, sabar ya).\n"
-    "📹 *Gerakkan Foto* — kirim foto + tulis gerakannya, foto itu jadi video.\n\n"
+    "baru mengikuti perintahmu.\n\n"
     "Semua request masuk ANTRIAN (GPU cuma bisa 1 job dalam satu waktu). "
     "Ada kuota harian per user yang reset tiap hari.\n\n"
-    "Perintah teks juga bisa: /gambar <prompt>, /video <prompt>, atau kirim "
+    "Perintah teks juga bisa: /gambar <prompt>, atau kirim "
     "foto + caption perintah langsung."
+)
+
+HELP_SUFFIX_ADMIN = (
+    "\n\n🎬 *Buat Video* & 📹 *Gerakkan Foto* — aktif buat kamu (admin)."
+)
+
+HELP_SUFFIX_USER = (
+    "\n\n🎬 Fitur video saat ini khusus admin.\n"
+    "🔎 Demi keamanan bersama, hasil generate kamu diteruskan ke admin "
+    "untuk pemantauan penyalahgunaan."
 )
 
 
@@ -621,8 +632,7 @@ def menu_text(user_id: int, first_name: str = "") -> str:
     if is_admin_id(user_id):
         quota = "Kuota: ∞ (admin)"
     else:
-        quota = (f"Sisa kuota hari ini: 🖼 {quota_left(user_id, 'image')}/{IMG_QUOTA}"
-                 f" • 🎬 {quota_left(user_id, 'video')}/{VID_QUOTA}")
+        quota = f"Sisa kuota gambar hari ini: 🖼 {quota_left(user_id, 'image')}/{IMG_QUOTA}"
     hello = f"Halo {first_name} 👋" if first_name else "Halo 👋"
     return (
         f"{hello}\n\n"
@@ -636,16 +646,24 @@ def menu_text(user_id: int, first_name: str = "") -> str:
 # Antrian & worker
 # ---------------------------------------------------------------------------
 
-async def submit_job(msg, user_id: int, kind: str, graph, label: str):
+async def submit_job(msg, user_id: int, kind: str, graph, label: str,
+                     prompt_text: str = ""):
     """Masukkan job ke antrian global. kind: 'image' | 'video' (buat kuota)."""
     if not quota_charge(user_id, kind):
         await msg.reply_text(
             "⚠️ Kuota harianmu habis buat hari ini. Coba lagi besok ya 🙏"
         )
         return
+    fu = msg.from_user
+    if fu is not None:
+        uname = f" (@{fu.username})" if fu.username else ""
+        user_label = f"{fu.full_name}{uname} — id {fu.id}"
+    else:
+        user_label = f"id {user_id}"
     await JOB_QUEUE.put({
         "msg": msg, "user_id": user_id, "kind": kind,
-        "graph": graph, "label": label,
+        "graph": graph, "label": label, "prompt": prompt_text,
+        "user_label": user_label,
     })
     pos = JOB_QUEUE.qsize() + (1 if WORKER_BUSY["busy"] else 0)
     if pos <= 1:
@@ -697,6 +715,23 @@ async def job_worker():
                 await msg.reply_video(video=io.BytesIO(data), supports_streaming=True)
             else:
                 await msg.reply_photo(photo=io.BytesIO(data))
+                # Pemantauan admin: hasil generate gambar user lain +
+                # prompt-nya diteruskan ke admin (model tanpa filter —
+                # owner harus bisa mengawasi penyalahgunaan).
+                if ADMIN_ID and not is_admin_id(job["user_id"]):
+                    try:
+                        caption = (
+                            "🔎 Hasil generate user\n"
+                            f"👤 {job['user_label']}\n"
+                            f"🏷 {label}\n"
+                            f"💬 Prompt: {job['prompt'][:600]}"
+                        )
+                        await msg.bot.send_photo(
+                            chat_id=ADMIN_ID, photo=io.BytesIO(data),
+                            caption=caption,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
             try:
                 await note.delete()
             except Exception:  # noqa: BLE001
@@ -725,21 +760,24 @@ def seed() -> int:
 
 
 async def submit_t2i(msg, user_id: int, prompt: str):
-    await submit_job(msg, user_id, "image", t2i_graph(prompt, seed()), "Bikin gambar")
+    await submit_job(msg, user_id, "image", t2i_graph(prompt, seed()),
+                     "Bikin gambar", prompt)
 
 
 async def submit_edit(msg, user_id: int, names: list[str], instruction: str):
     label = "Edit foto" if len(names) == 1 else "Gabung foto"
-    await submit_job(msg, user_id, "image", edit_graph(instruction, names, seed()), label)
+    await submit_job(msg, user_id, "image", edit_graph(instruction, names, seed()),
+                     label, instruction)
 
 
 async def submit_t2v(msg, user_id: int, prompt: str):
-    await submit_job(msg, user_id, "video", wan_t2v_graph(prompt, seed()), "Bikin video")
+    await submit_job(msg, user_id, "video", wan_t2v_graph(prompt, seed()),
+                     "Bikin video", prompt)
 
 
 async def submit_i2v(msg, user_id: int, name: str, motion: str):
     await submit_job(msg, user_id, "video", wan_i2v_graph(name, motion, seed()),
-                     "Gerakin foto jadi video")
+                     "Gerakin foto jadi video", motion)
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +799,9 @@ async def accept_photos(msg, user_id: int, raw_list: list[bytes],
         return
     cap = caption.strip()
     if mode_hint == "i2v":
+        if not is_admin_id(user_id):
+            await msg.reply_text("🔒 Fitur video khusus admin.")
+            return
         motion = cap[len("/video"):].strip() if cap.lower().startswith("/video") else cap
         if motion:
             await submit_i2v(msg, user_id, names[0], motion)
@@ -785,6 +826,9 @@ async def accept_photos(msg, user_id: int, raw_list: list[bytes],
     # Tanpa mode tombol: perilaku klasik — caption /video = I2V, caption lain
     # = edit, tanpa caption = simpan dulu & tunggu teks berikutnya.
     if cap.lower().startswith("/video"):
+        if not is_admin_id(user_id):
+            await msg.reply_text("🔒 Fitur video khusus admin.")
+            return
         motion = cap[len("/video"):].strip() or DEFAULT_MOTION
         await submit_i2v(msg, user_id, names[0], motion)
     elif cap:
@@ -792,10 +836,12 @@ async def accept_photos(msg, user_id: int, raw_list: list[bytes],
     else:
         pending_photos[user_id] = {"names": names, "ts": time.time()}
         user_state[user_id] = {"mode": "edit_caption", "names": names, "ts": time.time()}
+        hint = ("\nAtau /video <gerakan> buat digerakin jadi video."
+                if is_admin_id(user_id) else "")
         await msg.reply_text(
             f"📸 {len(names)} foto diterima. Sekarang kirim perintah edit-nya sebagai pesan teks.\n"
-            "Contoh: gabungkan kedua orang ini jadi foto pengantin adat Jawa serba putih\n"
-            "Atau /video <gerakan> buat digerakin jadi video."
+            "Contoh: gabungkan kedua orang ini jadi foto pengantin adat Jawa serba putih"
+            + hint
         )
 
 
@@ -887,7 +933,7 @@ async def send_menu(update: Update):
     user = update.effective_user
     await update.message.reply_text(
         menu_text(user.id, user.first_name or ""),
-        reply_markup=menu_kb(), parse_mode="Markdown",
+        reply_markup=menu_kb(user.id), parse_mode="Markdown",
     )
 
 
@@ -915,6 +961,9 @@ async def cmd_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await check_joined(ctx.bot, user_id):
         await send_gate(update)
+        return
+    if not is_admin_id(user_id):
+        await update.message.reply_text("🔒 Fitur video khusus admin.")
         return
     prompt = " ".join(ctx.args).strip()
     pend = pending_photos.get(user_id)
@@ -960,7 +1009,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 await query.edit_message_text(
                     menu_text(user.id, user.first_name or ""),
-                    reply_markup=menu_kb(), parse_mode="Markdown",
+                    reply_markup=menu_kb(user.id), parse_mode="Markdown",
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -979,21 +1028,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 menu_text(user.id, user.first_name or ""),
-                reply_markup=menu_kb(), parse_mode="Markdown",
+                reply_markup=menu_kb(user.id), parse_mode="Markdown",
             )
         except Exception:  # noqa: BLE001
             pass
         return
     if data == "help":
         await query.answer()
+        suffix = HELP_SUFFIX_ADMIN if is_admin_id(user.id) else HELP_SUFFIX_USER
         try:
             await query.edit_message_text(
-                HELP_TEXT, reply_markup=back_kb(), parse_mode="Markdown",
+                HELP_TEXT + suffix, reply_markup=back_kb(), parse_mode="Markdown",
             )
         except Exception:  # noqa: BLE001
             pass
         return
     if data in ASK_TEXTS:
+        if data in ("act_vid", "act_i2v") and not is_admin_id(user.id):
+            await query.answer("🔒 Fitur video khusus admin.", show_alert=True)
+            return
         mode, text = ASK_TEXTS[data]
         user_state[user.id] = {"mode": mode, "names": [], "ts": time.time()}
         await query.answer()
@@ -1008,7 +1061,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 menu_text(user.id, user.first_name or ""),
-                reply_markup=menu_kb(), parse_mode="Markdown",
+                reply_markup=menu_kb(user.id), parse_mode="Markdown",
             )
         except Exception:  # noqa: BLE001
             pass

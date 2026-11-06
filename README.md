@@ -25,6 +25,8 @@ The bot now ships in a public configuration built for sharing with a community:
 - **Button-first UI** — an inline-keyboard main menu (Make Image / Edit Photo / Make Video / Animate Photo / Help); no commands to memorize, text commands still work
 - **Global queue** — one GPU means one job at a time; everyone sees their queue position and a live progress bar
 - **Per-user daily quotas** for images and videos (configurable in `.env`, admin exempt, failed jobs refunded)
+- **Video is admin-only** in public mode — regular users get image generation and editing; the expensive video features stay with the operator
+- **Abuse monitoring** — because the image model is unfiltered, every image a regular user generates (result + prompt + user identity) is forwarded to the admin's Telegram for oversight; users are told this in the Help screen
 
 ## Why GGUF, and why a V100?
 
