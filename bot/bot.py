@@ -820,7 +820,7 @@ async def job_worker():
                         f"💬 Prompt: {job['prompt'][:600]}"
                     )
                     try:
-                        await msg.bot.send_photo(
+                        await msg.get_bot().send_photo(
                             chat_id=ADMIN_ID, photo=io.BytesIO(data),
                             caption=caption,
                         )
@@ -830,7 +830,7 @@ async def job_worker():
                     except Exception:  # noqa: BLE001
                         logging.exception("[PANTAU] gagal kirim foto ke admin")
                         try:
-                            await msg.bot.send_message(
+                            await msg.get_bot().send_message(
                                 chat_id=ADMIN_ID, text=caption)
                         except Exception:  # noqa: BLE001
                             logging.exception(
