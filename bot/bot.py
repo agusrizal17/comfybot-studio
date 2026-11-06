@@ -101,9 +101,10 @@ DEFAULT_MOTION = (
 )
 
 # --- HunyuanVideo 1.5 GGUF (video kedua; terpasang via install-hunyuan15.sh) ---
-# Resep template resmi ComfyUI: 720p, 121 frame @24fps, euler, shift 7.
-# T2V pakai model reguler (20 step CFG 6); I2V pakai varian CFG-distilled
-# (8 step CFG 1) biar cepat, pola yang sama kayak Lightning di Wan.
+# Resep DITURUNKAN dari template resmi (720p/121 frame) ke ±480p/81 frame:
+# di V100 ini GPU berbagi dengan miner host + VRAM sesak, 720p jalan
+# ±490 detik/step (62 menit/8 step) — tidak viable. Distilled I2V: 8 step
+# CFG 1; T2V reguler: 16 step CFG 6. Deadline job Hunyuan 45 menit.
 HY_T2V_FILE = "hunyuanvideo1.5_720p_t2v-Q8_0.gguf"
 HY_I2V_FILE = "hunyuanvideo1.5_720p_i2v_cfg_distilled-Q8_0.gguf"
 HY_VAE = "hunyuanvideo15_vae_fp16.safetensors"
@@ -318,16 +319,16 @@ def _hy_nodes(unet_file, prompt):
 
 
 def hy_t2v_graph(prompt: str, seed: int):
-    """Teks -> video Hunyuan 1.5 1280x720, 121 frame @24fps (±5 detik)."""
+    """Teks -> video Hunyuan 1.5 832x480, 81 frame @24fps (±3,4 detik)."""
     g = _hy_nodes(HY_T2V_FILE, prompt)
     g.update({
         "6": {"class_type": "EmptyHunyuanVideo15Latent",
-              "inputs": {"width": 1280, "height": 720, "length": 121,
+              "inputs": {"width": 832, "height": 480, "length": 81,
                          "batch_size": 1}},
         "8": {"class_type": "KSampler",
               "inputs": {"model": ["5", 0], "positive": ["3", 0],
                          "negative": ["4", 0], "latent_image": ["6", 0],
-                         "seed": seed, "steps": 20, "cfg": 6.0,
+                         "seed": seed, "steps": 16, "cfg": 6.0,
                          "sampler_name": "euler", "scheduler": "simple",
                          "denoise": 1.0}},
         "9": {"class_type": "VAEDecode",
@@ -339,18 +340,18 @@ def hy_t2v_graph(prompt: str, seed: int):
 
 
 def hy_i2v_graph(image_name: str, prompt: str, seed: int):
-    """Foto -> video Hunyuan 1.5 (distilled): foto diskalakan ke ±720p."""
+    """Foto -> video Hunyuan 1.5 (distilled): foto diskalakan ke ±480p."""
     g = _hy_nodes(HY_I2V_FILE, prompt)
     g.update({
         "11": {"class_type": "LoadImage", "inputs": {"image": image_name}},
         "12": {"class_type": "ImageScaleToTotalPixels",
                "inputs": {"image": ["11", 0], "upscale_method": "lanczos",
-                          "megapixels": 0.92, "resolution_steps": 16}},
+                          "megapixels": 0.4, "resolution_steps": 16}},
         "13": {"class_type": "GetImageSize", "inputs": {"image": ["12", 0]}},
         "14": {"class_type": "HunyuanVideo15ImageToVideo",
                "inputs": {"positive": ["3", 0], "negative": ["4", 0],
                           "vae": ["7", 0], "width": ["13", 0],
-                          "height": ["13", 1], "length": 121,
+                          "height": ["13", 1], "length": 81,
                           "batch_size": 1, "start_image": ["12", 0]}},
         "8": {"class_type": "KSampler",
               "inputs": {"model": ["5", 0], "positive": ["14", 0],
@@ -702,7 +703,7 @@ HELP_TEXT = (
 HELP_SUFFIX_ADMIN = (
     "\n\n🎬 *Buat Video* & 📹 *Gerakkan Foto* — aktif buat kamu (admin). "
     "Pas bikin video kamu bisa milih mesin: Wan 2.2 (detail, lambat) atau "
-    "Hunyuan 1.5 (720p, lebih cepat)."
+    "Hunyuan 1.5 (lebih ringan)."
 )
 
 HELP_SUFFIX_USER = (
@@ -729,7 +730,8 @@ def menu_text(user_id: int, first_name: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 async def submit_job(msg, user_id: int, kind: str, graph, label: str,
-                     prompt_text: str = "", fps: int = VIDEO_FPS):
+                     prompt_text: str = "", fps: int = VIDEO_FPS,
+                     deadline: int | None = None):
     """Masukkan job ke antrian global. kind: 'image' | 'video' (buat kuota)."""
     if not quota_charge(user_id, kind):
         await msg.reply_text(
@@ -745,7 +747,7 @@ async def submit_job(msg, user_id: int, kind: str, graph, label: str,
     await JOB_QUEUE.put({
         "msg": msg, "user_id": user_id, "kind": kind,
         "graph": graph, "label": label, "prompt": prompt_text,
-        "user_label": user_label, "fps": fps,
+        "user_label": user_label, "fps": fps, "deadline": deadline,
     })
     pos = JOB_QUEUE.qsize() + (1 if WORKER_BUSY["busy"] else 0)
     if pos <= 1:
@@ -790,7 +792,7 @@ async def job_worker():
             edit_task = asyncio.create_task(editor())
             data = await asyncio.to_thread(
                 comfy_run, job["graph"], state, kind,
-                1800 if kind == "video" else 900,
+                job.get("deadline") or (1800 if kind == "video" else 900),
                 job.get("fps", VIDEO_FPS),
             )
             edit_task.cancel()
@@ -856,7 +858,8 @@ async def submit_edit(msg, user_id: int, names: list[str], instruction: str):
 async def submit_t2v(msg, user_id: int, prompt: str, engine: str = "wan"):
     if engine == "hy":
         await submit_job(msg, user_id, "video", hy_t2v_graph(prompt, seed()),
-                         "Bikin video (Hunyuan 1.5)", prompt, fps=HY_FPS)
+                         "Bikin video (Hunyuan 1.5)", prompt, fps=HY_FPS,
+                         deadline=2700)
     else:
         await submit_job(msg, user_id, "video", wan_t2v_graph(prompt, seed()),
                          "Bikin video", prompt)
@@ -867,7 +870,7 @@ async def submit_i2v(msg, user_id: int, name: str, motion: str,
     if engine == "hy":
         await submit_job(msg, user_id, "video", hy_i2v_graph(name, motion, seed()),
                          "Gerakin foto jadi video (Hunyuan 1.5)", motion,
-                         fps=HY_FPS)
+                         fps=HY_FPS, deadline=2700)
     else:
         await submit_job(msg, user_id, "video", wan_i2v_graph(name, motion, seed()),
                          "Gerakin foto jadi video", motion)
@@ -1149,7 +1152,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Wan 2.2 — detail, lebih lambat",
                                   callback_data=f"eng:wan:{kind}")],
-            [InlineKeyboardButton("Hunyuan 1.5 — 720p, lebih cepat",
+            [InlineKeyboardButton("Hunyuan 1.5 — lebih ringan",
                                   callback_data=f"eng:hy:{kind}")],
             [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
         ])
