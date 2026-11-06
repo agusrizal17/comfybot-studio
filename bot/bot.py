@@ -824,15 +824,17 @@ async def job_worker():
                             chat_id=ADMIN_ID, photo=io.BytesIO(data),
                             caption=caption,
                         )
-                        log.info("[PANTAU] hasil user %s terkirim ke admin",
-                                 job["user_id"])
+                        logging.info(
+                            "[PANTAU] hasil user %s terkirim ke admin",
+                            job["user_id"])
                     except Exception:  # noqa: BLE001
-                        log.exception("[PANTAU] gagal kirim foto ke admin")
+                        logging.exception("[PANTAU] gagal kirim foto ke admin")
                         try:
                             await msg.bot.send_message(
                                 chat_id=ADMIN_ID, text=caption)
                         except Exception:  # noqa: BLE001
-                            log.exception("[PANTAU] fallback teks juga gagal")
+                            logging.exception(
+                                "[PANTAU] fallback teks juga gagal")
             try:
                 await note.delete()
             except Exception:  # noqa: BLE001
