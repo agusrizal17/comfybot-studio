@@ -53,16 +53,17 @@ QUOTA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quota.jso
 # diambil — ekspresi dan pakaian selalu dibuat baru mengikuti caption,
 # kecuali user menulis sebaliknya di caption-nya.
 EDIT_PREFIX = (
-    "ATURAN WAJIB, laksanakan sebelum membaca instruksi adegan: dari "
-    "foto referensi ambil HANYA wajah dan identitas orangnya (bentuk "
-    "wajah, struktur rahang, hidung, telinga, warna dan tekstur kulit, "
-    "proporsi kepala). DILARANG menyalin ekspresi dari foto referensi: "
+    "ATURAN WAJIB: dari foto referensi ambil HANYA wajah dan identitas "
+    "orangnya (bentuk wajah, rahang, hidung, telinga, warna dan tekstur "
+    "kulit, proporsi kepala). DILARANG menyalin ekspresi foto referensi: "
     "buat ekspresi baru yaitu kedua mata terbuka menatap kamera dan "
     "tersenyum natural, kecuali instruksi adegan meminta ekspresi lain. "
     "DILARANG memakai pakaian yang sama dengan foto referensi: ganti "
     "dengan pakaian baru sesuai instruksi adegan; bila adegan tidak "
-    "menyebut pakaian, gunakan pakaian kasual rapi yang serasi dan "
-    "berbeda dari foto referensi.\n\nInstruksi adegan: "
+    "menyebut pakaian, gunakan pakaian kasual rapi yang berbeda dari "
+    "foto referensi.\n\nInstruksi adegan berikut WAJIB dilaksanakan "
+    "SEPENUHNYA — termasuk mengganti latar, pose, dan komposisi, serta "
+    "menambah orang atau objek sesuai permintaan:\n"
 )
 
 COMBINE_PREFIX = (
@@ -812,19 +813,26 @@ async def job_worker():
                 # prompt-nya diteruskan ke admin (model tanpa filter —
                 # owner harus bisa mengawasi penyalahgunaan).
                 if ADMIN_ID and not is_admin_id(job["user_id"]):
+                    caption = (
+                        "🔎 Hasil generate user\n"
+                        f"👤 {job['user_label']}\n"
+                        f"🏷 {label}\n"
+                        f"💬 Prompt: {job['prompt'][:600]}"
+                    )
                     try:
-                        caption = (
-                            "🔎 Hasil generate user\n"
-                            f"👤 {job['user_label']}\n"
-                            f"🏷 {label}\n"
-                            f"💬 Prompt: {job['prompt'][:600]}"
-                        )
                         await msg.bot.send_photo(
                             chat_id=ADMIN_ID, photo=io.BytesIO(data),
                             caption=caption,
                         )
+                        log.info("[PANTAU] hasil user %s terkirim ke admin",
+                                 job["user_id"])
                     except Exception:  # noqa: BLE001
-                        pass
+                        log.exception("[PANTAU] gagal kirim foto ke admin")
+                        try:
+                            await msg.bot.send_message(
+                                chat_id=ADMIN_ID, text=caption)
+                        except Exception:  # noqa: BLE001
+                            log.exception("[PANTAU] fallback teks juga gagal")
             try:
                 await note.delete()
             except Exception:  # noqa: BLE001
