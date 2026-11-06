@@ -75,6 +75,17 @@ UNET = "qwen-image-2.1-turbo-Q8_0.gguf"
 CLIP = "qwen3vl_8b_int8_convrot.safetensors"
 VAE = "qwen_image_2.1_vae_bf16.safetensors"
 
+# --- Model edit KHUSUS: Qwen-Image-Edit-2511 GGUF (unduh install-qwen-edit.sh) ---
+# Model edit beneran (bukan turbo): jauh lebih patuh instruksi adegan,
+# tapi lambat — resep template resmi dipadatkan ke 20 step CFG 3 biar
+# masuk akal di V100. Encoder & VAE-nya beda dari stack turbo (2.5-VL),
+# jadi graph edit punya loader sendiri.
+EDIT_UNET = "qwen-image-edit-2511-Q6_K.gguf"
+EDIT_CLIP = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
+EDIT_VAE = "qwen_image_vae.safetensors"
+EDIT_STEPS = 20
+EDIT_CFG = 3.0
+
 # --- Wan 2.2 A14B GGUF (video) ---
 WAN_VAE = "Wan2.1_VAE.safetensors"
 WAN_T5 = "umt5-xxl-encoder-Q8_0.gguf"
@@ -185,7 +196,17 @@ def t2i_graph(prompt: str, seed: int):
 
 
 def edit_graph(prompt: str, image_names: list[str], seed: int):
-    g = base_nodes()
+    # Loader sendiri: model edit 2511 + encoder 2.5-VL + VAE qwen_image.
+    g = {
+        "1": {"class_type": "UnetLoaderGGUF",
+              "inputs": {"unet_name": EDIT_UNET}},
+        "2": {"class_type": "ModelSamplingAuraFlow",
+              "inputs": {"model": ["1", 0], "shift": 3.1}},
+        "3": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": EDIT_CLIP, "type": "qwen_image",
+                         "device": "default"}},
+        "6": {"class_type": "VAELoader", "inputs": {"vae_name": EDIT_VAE}},
+    }
     g.update({
         "11": {"class_type": "LoadImage", "inputs": {"image": image_names[0]}},
         "12": {"class_type": "ImageScaleToTotalPixels",
@@ -207,10 +228,13 @@ def edit_graph(prompt: str, image_names: list[str], seed: int):
     g.update({
         "14": {"class_type": "ConditioningZeroOut",
                "inputs": {"conditioning": ["13", 0]}},
+        "21": {"class_type": "FluxKontextMultiReferenceLatentMethod",
+               "inputs": {"conditioning": ["13", 0],
+                          "reference_latents_method": "index_timestep_zero"}},
         "16": {"class_type": "KSampler",
-               "inputs": {"model": ["2", 0], "positive": ["13", 0],
+               "inputs": {"model": ["2", 0], "positive": ["21", 0],
                           "negative": ["14", 0], "latent_image": ["15", 0],
-                          "seed": seed, "steps": 8, "cfg": 1.0,
+                          "seed": seed, "steps": EDIT_STEPS, "cfg": EDIT_CFG,
                           "sampler_name": "euler", "scheduler": "simple",
                           "denoise": 1.0}},
         "17": {"class_type": "VAEDecode",
@@ -870,7 +894,7 @@ async def submit_t2i(msg, user_id: int, prompt: str):
 async def submit_edit(msg, user_id: int, names: list[str], instruction: str):
     label = "Edit foto" if len(names) == 1 else "Gabung foto"
     await submit_job(msg, user_id, "image", edit_graph(instruction, names, seed()),
-                     label, instruction)
+                     label, instruction, deadline=1800)
 
 
 async def submit_t2v(msg, user_id: int, prompt: str, engine: str = "wan"):
