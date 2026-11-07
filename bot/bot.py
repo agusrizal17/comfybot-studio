@@ -77,13 +77,14 @@ VAE = "qwen_image_2.1_vae_bf16.safetensors"
 
 # --- Model edit KHUSUS: Qwen-Image-Edit-2511 GGUF (unduh install-qwen-edit.sh) ---
 # Model edit beneran (bukan turbo): jauh lebih patuh instruksi adegan,
-# tapi lambat — resep template resmi dipadatkan ke 20 step CFG 3 biar
-# masuk akal di V100. Encoder & VAE-nya beda dari stack turbo (2.5-VL),
+# tapi lambat. Resep diringankan 7 Nov setelah uji lapangan 20 step
+# tembus timeout 30 menit di V100 (berbagi miner host): 12 step CFG 3,
+# skala edit 0,7MP. Encoder & VAE-nya beda dari stack turbo (2.5-VL),
 # jadi graph edit punya loader sendiri.
 EDIT_UNET = "qwen-image-edit-2511-Q6_K.gguf"
 EDIT_CLIP = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
 EDIT_VAE = "qwen_image_vae.safetensors"
-EDIT_STEPS = 20
+EDIT_STEPS = 12
 EDIT_CFG = 3.0
 
 # --- Wan 2.2 A14B GGUF (video) ---
@@ -218,7 +219,7 @@ def edit_graph(prompt: str, image_names: list[str], seed: int):
         "11": {"class_type": "LoadImage", "inputs": {"image": image_names[0]}},
         "12": {"class_type": "ImageScaleToTotalPixels",
                "inputs": {"image": ["11", 0], "upscale_method": "lanczos",
-                          "megapixels": 1.0, "resolution_steps": 1}},
+                          "megapixels": 0.7, "resolution_steps": 1}},
         "15": {"class_type": "VAEEncode",
                "inputs": {"pixels": ["12", 0], "vae": ["6", 0]}},
     })
@@ -228,7 +229,7 @@ def edit_graph(prompt: str, image_names: list[str], seed: int):
         g["19"] = {"class_type": "LoadImage", "inputs": {"image": image_names[1]}}
         g["20"] = {"class_type": "ImageScaleToTotalPixels",
                    "inputs": {"image": ["19", 0], "upscale_method": "lanczos",
-                              "megapixels": 1.0, "resolution_steps": 1}}
+                              "megapixels": 0.7, "resolution_steps": 1}}
         encode_inputs["image2"] = ["20", 0]
         encode_inputs["prompt"] = COMBINE_PREFIX + encode_inputs["prompt"]
     g["13"] = {"class_type": "TextEncodeQwenImageEditPlus", "inputs": encode_inputs}
@@ -301,7 +302,7 @@ def t2i_accurate_graph(prompt: str, seed: int):
         "14": {"class_type": "ConditioningZeroOut",
                "inputs": {"conditioning": ["13", 0]}},
         "7": {"class_type": "EmptySD3LatentImage",
-              "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+              "inputs": {"width": 896, "height": 896, "batch_size": 1}},
         "8": {"class_type": "KSampler",
               "inputs": {"model": ["2", 0], "positive": ["13", 0],
                          "negative": ["14", 0], "latent_image": ["7", 0],
