@@ -136,6 +136,8 @@ gate_cache: dict[int, tuple[float, bool]] = {}  # user_id -> (ts, joined)
 
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 WORKER_BUSY = {"busy": False}
+# Job edit yang menunggu pilihan model dari user (per user_id).
+PREJOBS: dict[int, dict] = {}
 
 STAGE_LABELS = {
     "UnetLoaderGGUF": "Muat model",
@@ -195,9 +197,9 @@ def t2i_graph(prompt: str, seed: int):
     return g
 
 
-def edit_graph(prompt: str, image_names: list[str], seed: int):
-    # Loader sendiri: model edit 2511 + encoder 2.5-VL + VAE qwen_image.
-    g = {
+def _edit_stack_nodes():
+    """Loader stack model edit 2511: unet GGUF + encoder 2.5-VL + VAE."""
+    return {
         "1": {"class_type": "UnetLoaderGGUF",
               "inputs": {"unet_name": EDIT_UNET}},
         "2": {"class_type": "ModelSamplingAuraFlow",
@@ -207,6 +209,11 @@ def edit_graph(prompt: str, image_names: list[str], seed: int):
                          "device": "default"}},
         "6": {"class_type": "VAELoader", "inputs": {"vae_name": EDIT_VAE}},
     }
+
+
+def edit_graph(prompt: str, image_names: list[str], seed: int):
+    # Model edit KHUSUS 2511 (akurat, lambat).
+    g = _edit_stack_nodes()
     g.update({
         "11": {"class_type": "LoadImage", "inputs": {"image": image_names[0]}},
         "12": {"class_type": "ImageScaleToTotalPixels",
@@ -241,6 +248,70 @@ def edit_graph(prompt: str, image_names: list[str], seed: int):
                "inputs": {"samples": ["16", 0], "vae": ["6", 0]}},
         "18": {"class_type": "SaveImage",
                "inputs": {"images": ["17", 0], "filename_prefix": "teleedit"}},
+    })
+    return g
+
+
+def edit_graph_turbo(prompt: str, image_names: list[str], seed: int):
+    """Edit pakai stack TURBO (cepat; nurut adegan seadanya)."""
+    g = base_nodes()
+    g.update({
+        "11": {"class_type": "LoadImage", "inputs": {"image": image_names[0]}},
+        "12": {"class_type": "ImageScaleToTotalPixels",
+               "inputs": {"image": ["11", 0], "upscale_method": "lanczos",
+                          "megapixels": 1.0, "resolution_steps": 1}},
+        "15": {"class_type": "VAEEncode",
+               "inputs": {"pixels": ["12", 0], "vae": ["6", 0]}},
+    })
+    encode_inputs = {"clip": ["3", 0], "vae": ["6", 0],
+                     "image1": ["12", 0], "prompt": EDIT_PREFIX + prompt}
+    if len(image_names) > 1:
+        g["19"] = {"class_type": "LoadImage", "inputs": {"image": image_names[1]}}
+        g["20"] = {"class_type": "ImageScaleToTotalPixels",
+                   "inputs": {"image": ["19", 0], "upscale_method": "lanczos",
+                              "megapixels": 1.0, "resolution_steps": 1}}
+        encode_inputs["image2"] = ["20", 0]
+        encode_inputs["prompt"] = COMBINE_PREFIX + encode_inputs["prompt"]
+    g["13"] = {"class_type": "TextEncodeQwenImageEditPlus",
+               "inputs": encode_inputs}
+    g.update({
+        "14": {"class_type": "ConditioningZeroOut",
+               "inputs": {"conditioning": ["13", 0]}},
+        "16": {"class_type": "KSampler",
+               "inputs": {"model": ["2", 0], "positive": ["13", 0],
+                          "negative": ["14", 0], "latent_image": ["15", 0],
+                          "seed": seed, "steps": 8, "cfg": 1.0,
+                          "sampler_name": "euler", "scheduler": "simple",
+                          "denoise": 1.0}},
+        "17": {"class_type": "VAEDecode",
+               "inputs": {"samples": ["16", 0], "vae": ["6", 0]}},
+        "18": {"class_type": "SaveImage",
+               "inputs": {"images": ["17", 0], "filename_prefix": "teleedit"}},
+    })
+    return g
+
+
+def t2i_accurate_graph(prompt: str, seed: int):
+    """Teks -> gambar pakai model 2511 tanpa foto referensi (akurat, lambat)."""
+    g = _edit_stack_nodes()
+    g.update({
+        "13": {"class_type": "TextEncodeQwenImageEditPlus",
+               "inputs": {"clip": ["3", 0], "vae": ["6", 0],
+                          "prompt": prompt}},
+        "14": {"class_type": "ConditioningZeroOut",
+               "inputs": {"conditioning": ["13", 0]}},
+        "7": {"class_type": "EmptySD3LatentImage",
+              "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+        "8": {"class_type": "KSampler",
+              "inputs": {"model": ["2", 0], "positive": ["13", 0],
+                         "negative": ["14", 0], "latent_image": ["7", 0],
+                         "seed": seed, "steps": EDIT_STEPS, "cfg": EDIT_CFG,
+                         "sampler_name": "euler", "scheduler": "simple",
+                         "denoise": 1.0}},
+        "9": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["8", 0], "vae": ["6", 0]}},
+        "10": {"class_type": "SaveImage",
+               "inputs": {"images": ["9", 0], "filename_prefix": "telebot"}},
     })
     return g
 
@@ -886,15 +957,29 @@ def seed() -> int:
     return random.randint(0, 2**31 - 1)
 
 
-async def submit_t2i(msg, user_id: int, prompt: str):
-    await submit_job(msg, user_id, "image", t2i_graph(prompt, seed()),
-                     "Bikin gambar", prompt)
+async def submit_t2i(msg, user_id: int, prompt: str, engine: str = "turbo"):
+    if engine == "acc":
+        await submit_job(msg, user_id, "image",
+                         t2i_accurate_graph(prompt, seed()),
+                         "Bikin gambar", prompt, deadline=1800)
+    else:
+        await submit_job(msg, user_id, "image", t2i_graph(prompt, seed()),
+                         "Bikin gambar", prompt)
 
 
 async def submit_edit(msg, user_id: int, names: list[str], instruction: str):
+    """Edit TIDAK langsung jalan: user pilih modelnya dulu (Turbo/Akurat)."""
     label = "Edit foto" if len(names) == 1 else "Gabung foto"
-    await submit_job(msg, user_id, "image", edit_graph(instruction, names, seed()),
-                     label, instruction, deadline=1800)
+    PREJOBS[user_id] = {"names": names, "instruction": instruction,
+                        "msg": msg, "label": label}
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Turbo — cepat",
+                              callback_data="model:edit:turbo")],
+        [InlineKeyboardButton("🎯 Akurat 2511 — nurut prompt, lambat",
+                              callback_data="model:edit:acc")],
+        [InlineKeyboardButton("❌ Batal", callback_data="cancel_state")],
+    ])
+    await msg.reply_text(f"✏️ {label} — pilih modelnya:", reply_markup=kb)
 
 
 async def submit_t2v(msg, user_id: int, prompt: str, engine: str = "wan"):
@@ -1046,7 +1131,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         mode = st["mode"]
         user_state.pop(user.id, None)
         if mode == "prompt_img":
-            await submit_t2i(msg, user.id, text)
+            await submit_t2i(msg, user.id, text, st.get("engine", "turbo"))
             return
         if mode == "prompt_vid":
             await submit_t2v(msg, user.id, text, st.get("engine", "wan"))
@@ -1216,6 +1301,56 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, reply_markup=cancel_kb())
         except Exception:  # noqa: BLE001
             pass
+        return
+    if data == "act_img":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡ Turbo — cepat",
+                                  callback_data="model:t2i:turbo")],
+            [InlineKeyboardButton("🎯 Akurat 2511 — nurut prompt, lambat",
+                                  callback_data="model:t2i:acc")],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
+        ])
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                "🖼 Buat Gambar\nPilih modelnya:", reply_markup=kb)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if data.startswith("model:"):
+        _, scope, choice = data.split(":")
+        await query.answer()
+        if scope == "t2i":
+            mode, text = ASK_TEXTS["act_img"]
+            user_state[user.id] = {"mode": mode, "names": [],
+                                   "engine": choice, "ts": time.time()}
+            try:
+                await query.edit_message_text(text, reply_markup=cancel_kb())
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # scope == "edit": jalankan job yang menunggu pilihan model.
+        pj = PREJOBS.pop(user.id, None)
+        if not pj:
+            try:
+                await query.edit_message_text(
+                    "Sesi editnya udah lewat — kirim ulang fotonya ya.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if choice == "acc":
+            graph = edit_graph(pj["instruction"], pj["names"], seed())
+            dl = 1800
+        else:
+            graph = edit_graph_turbo(pj["instruction"], pj["names"], seed())
+            dl = 900
+        try:
+            await query.edit_message_text(
+                f"✏️ {pj['label']} — model dipilih, masuk antrian…")
+        except Exception:  # noqa: BLE001
+            pass
+        await submit_job(pj["msg"], user.id, "image", graph, pj["label"],
+                         pj["instruction"], deadline=dl)
         return
     if data in ASK_TEXTS:
         mode, text = ASK_TEXTS[data]
