@@ -740,6 +740,16 @@ def _save_id_set(path: str, ids: set):
 USERS: set = _load_id_set(USERS_PATH)
 BLOCKED: set = _load_id_set(BLOCKED_PATH)
 
+# Pesan yang diterima user terblokir tiap mencoba memakai bot
+# (dibatasi maks 1x per jam per user biar tidak jadi banjir balasan).
+BLOCK_NOTICE = (
+    "Anda diblokir sementara oleh admin dengan alasan terlalu spam "
+    "melakukan generate gambar/foto, jika ada kendala pada bot harap "
+    "hubungi admin bot: @yaelahzal17"
+)
+NOTICE_INTERVAL = 3600
+_last_notice: dict = {}
+
 # Seed registry dari quota.json lama (user yang pernah generate sebelum v2.6)
 try:
     for _day in _quota_load().values():
@@ -774,12 +784,22 @@ def unblock_user(user_id: int):
 
 
 async def guard_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handler group -1: catat user ke registry; user terblokir diabaikan total."""
+    """Handler group -1: catat user ke registry; user terblokir dikirimi
+    pemberitahuan blokir (maks 1x/jam) lalu interaksinya diabaikan total."""
     user = update.effective_user
     if user is None:
         return
     register_user(user.id)
     if is_blocked(user.id):
+        now = time.time()
+        if now - _last_notice.get(user.id, 0) >= NOTICE_INTERVAL:
+            _last_notice[user.id] = now
+            chat = update.effective_chat
+            if chat is not None:
+                try:
+                    await ctx.bot.send_message(chat_id=chat.id, text=BLOCK_NOTICE)
+                except Exception:  # noqa: BLE001
+                    pass
         raise ApplicationHandlerStop
 
 
