@@ -12,6 +12,8 @@ Navigasi full tombol (inline keyboard) — perintah teks tetap jalan:
 Fitur publik: antrian global 1 GPU (satu job jalan dalam satu waktu),
 generate UNLIMITED tanpa kuota harian (sejak v2.5 — perintah owner),
 progress bar live via websocket ComfyUI. ADMIN_ID bebas gate + akses video.
+Sejak v2.6: registry user (users.json, buat broadcast) + blokir user per ID
+(blocked.json) + perintah admin /broadcast, /blokir, /unblokir, /blokirlist.
 
 Jalan di VM yang sama dengan ComfyUI (API localhost:8188).
 Konfigurasi via .env: BOT_TOKEN, ADMIN_ID, CHANNEL_USERNAME (@channel).
@@ -31,12 +33,15 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ChatMemberStatus
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
+from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.request import HTTPXRequest
 
 COMFY = "http://127.0.0.1:8188"
@@ -705,6 +710,203 @@ def quota_refund(user_id: int, kind: str):
         _quota_save(data)
 
 
+# ---------------------------------------------------------------------------
+# Registry user & blokir (v2.6)
+# users.json  : semua user yang pernah berinteraksi (target broadcast)
+# blocked.json: ID yang diblokir admin — semua interaksinya diabaikan total
+# ---------------------------------------------------------------------------
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_PATH = os.path.join(_BASE_DIR, "users.json")
+BLOCKED_PATH = os.path.join(_BASE_DIR, "blocked.json")
+
+
+def _load_id_set(path: str) -> set:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return {int(x) for x in json.load(fh)}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _save_id_set(path: str, ids: set):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(sorted(ids), fh)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+USERS: set = _load_id_set(USERS_PATH)
+BLOCKED: set = _load_id_set(BLOCKED_PATH)
+
+# Seed registry dari quota.json lama (user yang pernah generate sebelum v2.6)
+try:
+    for _day in _quota_load().values():
+        if isinstance(_day, dict):
+            for _uid in _day:
+                try:
+                    USERS.add(int(_uid))
+                except (TypeError, ValueError):
+                    pass
+except Exception:  # noqa: BLE001
+    pass
+
+
+def register_user(user_id: int):
+    if user_id and user_id not in USERS:
+        USERS.add(user_id)
+        _save_id_set(USERS_PATH, USERS)
+
+
+def is_blocked(user_id: int) -> bool:
+    return user_id != ADMIN_ID and user_id in BLOCKED
+
+
+def block_user(user_id: int):
+    BLOCKED.add(user_id)
+    _save_id_set(BLOCKED_PATH, BLOCKED)
+
+
+def unblock_user(user_id: int):
+    BLOCKED.discard(user_id)
+    _save_id_set(BLOCKED_PATH, BLOCKED)
+
+
+async def guard_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handler group -1: catat user ke registry; user terblokir diabaikan total."""
+    user = update.effective_user
+    if user is None:
+        return
+    register_user(user.id)
+    if is_blocked(user.id):
+        raise ApplicationHandlerStop
+
+
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not is_admin_id(update.effective_user.id):
+        return
+    reply = msg.reply_to_message
+    text = " ".join(ctx.args).strip()
+    if reply is None and not text:
+        await msg.reply_text(
+            "📣 Cara broadcast:\n"
+            "• /broadcast <teks> — kirim teks ke semua user terdaftar\n"
+            "• Reply pesan/foto apa pun dengan /broadcast — pesan itu yang "
+            "diteruskan ke semua user\n\n"
+            f"User terdaftar saat ini: {len(USERS - {ADMIN_ID})} "
+            f"(diblokir: {len(BLOCKED)})"
+        )
+        return
+    targets = sorted(USERS - {ADMIN_ID})
+    if not targets:
+        await msg.reply_text("Belum ada user terdaftar buat di-broadcast.")
+        return
+    await msg.reply_text(f"📣 Broadcast ke {len(targets)} user, mulai…")
+
+    async def deliver(uid: int) -> str:
+        try:
+            if reply is not None:
+                await ctx.bot.copy_message(
+                    chat_id=uid, from_chat_id=msg.chat_id,
+                    message_id=reply.message_id,
+                )
+            else:
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=uid, text=text, parse_mode="Markdown")
+                except TelegramError:
+                    await ctx.bot.send_message(chat_id=uid, text=text)
+            return "ok"
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 1)
+            try:
+                if reply is not None:
+                    await ctx.bot.copy_message(
+                        chat_id=uid, from_chat_id=msg.chat_id,
+                        message_id=reply.message_id,
+                    )
+                else:
+                    await ctx.bot.send_message(chat_id=uid, text=text)
+                return "ok"
+            except Exception:  # noqa: BLE001
+                return "fail"
+        except Forbidden:
+            return "gone"
+        except Exception:  # noqa: BLE001
+            return "fail"
+
+    ok = fail = gone = 0
+    for uid in targets:
+        res = await deliver(uid)
+        if res == "ok":
+            ok += 1
+        elif res == "gone":
+            gone += 1
+            USERS.discard(uid)
+        else:
+            fail += 1
+        await asyncio.sleep(0.07)
+    if gone:
+        _save_id_set(USERS_PATH, USERS)
+    await msg.reply_text(
+        "📣 Broadcast selesai.\n"
+        f"✅ Terkirim: {ok}\n"
+        f"❌ Gagal: {fail}\n"
+        f"🗑 Dihapus dari daftar (nge-block bot): {gone}"
+    )
+
+
+def _target_id(ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return None
+    try:
+        return int(ctx.args[0])
+    except (TypeError, ValueError):
+        return None
+
+
+async def cmd_blokir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_id(update.effective_user.id):
+        return
+    uid = _target_id(ctx)
+    if uid is None:
+        await update.message.reply_text("Cara pakai: /blokir <id_user>")
+        return
+    if uid == ADMIN_ID:
+        await update.message.reply_text("Nggak bisa blokir admin 😄")
+        return
+    block_user(uid)
+    await update.message.reply_text(
+        f"🚫 User {uid} diblokir — semua pesannya bakal diabaikan bot.\n"
+        f"Total diblokir: {len(BLOCKED)}"
+    )
+
+
+async def cmd_unblokir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_id(update.effective_user.id):
+        return
+    uid = _target_id(ctx)
+    if uid is None:
+        await update.message.reply_text("Cara pakai: /unblokir <id_user>")
+        return
+    unblock_user(uid)
+    await update.message.reply_text(
+        f"✅ Blokir user {uid} dibuka. Total diblokir: {len(BLOCKED)}"
+    )
+
+
+async def cmd_blokirlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_id(update.effective_user.id):
+        return
+    if not BLOCKED:
+        await update.message.reply_text("Daftar blokir kosong.")
+        return
+    ids = "\n".join(f"• {uid}" for uid in sorted(BLOCKED))
+    await update.message.reply_text(f"🚫 User diblokir ({len(BLOCKED)}):\n{ids}")
+
+
 async def check_joined(bot, user_id: int, force: bool = False) -> bool:
     """True bila user sudah join channel (atau gate nonaktif / admin)."""
     if is_admin_id(user_id) or not CHANNEL:
@@ -796,6 +998,8 @@ HELP_SUFFIX_ADMIN = (
     "\n\n🎬 *Buat Video* & 📹 *Gerakkan Foto* — aktif buat kamu (admin). "
     "Pas bikin video kamu bisa milih mesin: Wan 2.2 (detail, lambat) atau "
     "Hunyuan 1.5 (lebih ringan)."
+    "\n\n👑 Perintah admin: /broadcast (kirim pengumuman ke semua user), "
+    "/blokir <id>, /unblokir <id>, /blokirlist."
 )
 
 HELP_SUFFIX_USER = (
@@ -825,6 +1029,8 @@ async def submit_job(msg, user_id: int, kind: str, graph, label: str,
                      prompt_text: str = "", fps: int = VIDEO_FPS,
                      deadline: int | None = None):
     """Masukkan job ke antrian global. kind: 'image' | 'video' (buat kuota)."""
+    if is_blocked(user_id):
+        return
     if not quota_charge(user_id, kind):
         await msg.reply_text(
             "⚠️ Kuota harianmu habis buat hari ini. Coba lagi besok ya 🙏"
@@ -855,6 +1061,8 @@ async def job_worker():
     """Satu-satunya yang menjalankan ComfyUI — job diproses satu per satu."""
     while True:
         job = await JOB_QUEUE.get()
+        if is_blocked(job["user_id"]):
+            continue
         WORKER_BUSY["busy"] = True
         msg = job["msg"]
         kind = job["kind"]
@@ -1397,10 +1605,15 @@ def main():
         .post_init(_post_init)
         .build()
     )
+    app.add_handler(TypeHandler(Update, guard_update), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_start))
     app.add_handler(CommandHandler("gambar", cmd_gambar))
     app.add_handler(CommandHandler("video", cmd_video))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("blokir", cmd_blokir))
+    app.add_handler(CommandHandler("unblokir", cmd_unblokir))
+    app.add_handler(CommandHandler("blokirlist", cmd_blokirlist))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
