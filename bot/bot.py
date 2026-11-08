@@ -10,12 +10,11 @@ Navigasi full tombol (inline keyboard) — perintah teks tetap jalan:
 - /video <prompt>              -> text-to-video; foto + caption /video = I2V
 
 Fitur publik: antrian global 1 GPU (satu job jalan dalam satu waktu),
-kuota harian per user (gambar/video, bisa diatur via .env), progress bar
-live via websocket ComfyUI. ADMIN_ID bebas kuota & bebas gate.
+generate UNLIMITED tanpa kuota harian (sejak v2.5 — perintah owner),
+progress bar live via websocket ComfyUI. ADMIN_ID bebas gate + akses video.
 
 Jalan di VM yang sama dengan ComfyUI (API localhost:8188).
-Konfigurasi via .env: BOT_TOKEN, ADMIN_ID, CHANNEL_USERNAME (@channel),
-IMG_QUOTA (default 10), VID_QUOTA (default 3).
+Konfigurasi via .env: BOT_TOKEN, ADMIN_ID, CHANNEL_USERNAME (@channel).
 """
 import asyncio
 import io
@@ -692,19 +691,7 @@ def quota_left(user_id: int, kind: str) -> int:
 
 
 def quota_charge(user_id: int, kind: str) -> bool:
-    """Kurangi kuota 1. True bila berhasil (atau admin)."""
-    if is_admin_id(user_id):
-        return True
-    data = _quota_load()
-    today = _today()
-    day = {today: data.get(today, {})}  # buang hari lama sekalian
-    rec = day[today].setdefault(str(user_id), {"image": 0, "video": 0})
-    limit = IMG_QUOTA if kind == "image" else VID_QUOTA
-    if int(rec.get(kind, 0)) >= limit:
-        _quota_save(day)
-        return False
-    rec[kind] = int(rec.get(kind, 0)) + 1
-    _quota_save(day)
+    """v2.5: generate UNLIMITED untuk semua user — selalu True, tanpa catat kuota."""
     return True
 
 
@@ -820,7 +807,7 @@ def menu_text(user_id: int, first_name: str = "") -> str:
     if is_admin_id(user_id):
         quota = "Kuota: ∞ (admin)"
     else:
-        quota = f"Sisa kuota gambar hari ini: 🖼 {quota_left(user_id, 'image')}/{IMG_QUOTA}"
+        quota = "Kuota: ∞ — unlimited, generate sepuasnya 🎉"
     hello = f"Halo {first_name} 👋" if first_name else "Halo 👋"
     return (
         f"{hello}\n\n"
